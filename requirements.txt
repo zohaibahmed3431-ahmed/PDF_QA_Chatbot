@@ -1,4 +1,4 @@
-gradio
+streamlit
 pypdf
 sentence-transformers
 faiss-cpu
