@@ -91,7 +91,6 @@ def process_pdfs(uploaded_files):
 
 def ask_pdf(question, vector_db, chunks):
 
-    # Stop words remove karke important keywords nikalna
     stop_words = {
         "what", "where", "when", "which", "who",
         "how", "are", "is", "the", "a", "an",
@@ -100,20 +99,25 @@ def ask_pdf(question, vector_db, chunks):
         "hai", "hain", "kya"
     }
 
-    clean_question = re.sub(r"[^a-zA-Z0-9\s]", " ", question.lower())
+    clean_question = re.sub(
+        r"[^a-zA-Z0-9\s]",
+        " ",
+        question.lower()
+    )
+
+    words = clean_question.split()
 
     keywords = [
-        word for word in clean_question.split()
+        word for word in words
         if len(word) >= 3 and word not in stop_words
     ]
 
-    # Page-finding questions ke liye keyword search
     page_question_words = {
-        "page", "pages", "pagees", "kis", "where"
+        "page", "pages", "where", "kis"
     }
 
     is_page_question = any(
-        word in clean_question.split()
+        word in words
         for word in page_question_words
     )
 
@@ -124,7 +128,6 @@ def ask_pdf(question, vector_db, chunks):
         for chunk in chunks:
 
             text = chunk["text"].lower()
-
             score = 0
 
             for keyword in keywords:
@@ -132,12 +135,12 @@ def ask_pdf(question, vector_db, chunks):
                 if keyword in text:
                     score += 1
 
-                # singular/plural matching
-                if keyword.endswith("s") and keyword[:-1] in text:
-                    score += 1
-
-                if not keyword.endswith("s") and (keyword + "s") in text:
-                    score += 1
+                if keyword.endswith("s"):
+                    if keyword[:-1] in text:
+                        score += 1
+                else:
+                    if keyword + "s" in text:
+                        score += 1
 
             if score > 0:
                 matched_pages.append(
@@ -148,7 +151,6 @@ def ask_pdf(question, vector_db, chunks):
                     )
                 )
 
-        # Highest matching pages first
         matched_pages.sort(
             key=lambda x: x[0],
             reverse=True
@@ -167,15 +169,18 @@ def ask_pdf(question, vector_db, chunks):
                     (source, page)
                 )
 
-            if unique_pages:
+        if unique_pages:
 
             answer = "### 📄 Relevant Pages\n\n"
 
             for source, page in unique_pages:
-                answer += f"- **{source}** — Page **{page}**\n"
+                answer += (
+                    f"- **{source}** — "
+                    f"Page **{page}**\n"
+                )
 
             return answer
-    # Normal semantic search
+
     question_embedding = embedding_model.encode(
         [question],
         normalize_embeddings=True
@@ -188,7 +193,7 @@ def ask_pdf(question, vector_db, chunks):
 
     scores, indices = vector_db.search(
         question_embedding,
-        min(5, len(chunks))
+        min(10, len(chunks))
     )
 
     results = []
@@ -252,7 +257,6 @@ Give a clear and concise answer.
         )
 
     return answer + sources
-
 
 # Session state
 if "vector_db" not in st.session_state:
