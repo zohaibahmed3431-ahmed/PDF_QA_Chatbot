@@ -167,7 +167,7 @@ def ask_pdf(question, vector_db, chunks):
                     (source, page)
                 )
 
-             if unique_pages:
+            if unique_pages:
 
             answer = "### 📄 Relevant Pages\n\n"
 
