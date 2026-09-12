@@ -167,7 +167,7 @@ def ask_pdf(question, vector_db, chunks):
                     (source, page)
                 )
 
-                if unique_pages:
+             if unique_pages:
 
             answer = "### 📄 Relevant Pages\n\n"
 
@@ -175,44 +175,6 @@ def ask_pdf(question, vector_db, chunks):
                 answer += f"- **{source}** — Page **{page}**\n"
 
             return answer
-
-        # If keyword search finds nothing, use semantic search
-        question_embedding = embedding_model.encode(
-            [question],
-            normalize_embeddings=True
-        )
-
-        question_embedding = np.array(
-            question_embedding,
-            dtype="float32"
-        )
-
-        scores, indices = vector_db.search(
-            question_embedding,
-            min(10, len(chunks))
-        )
-
-        semantic_pages = []
-        seen = set()
-
-        for index in indices[0]:
-
-            result = chunks[index]
-            key = (result["source"], result["page"])
-
-            if key not in seen:
-                seen.add(key)
-                semantic_pages.append(key)
-
-        if semantic_pages:
-
-            answer = "### 📄 Relevant Pages\n\n"
-
-            for source, page in semantic_pages:
-                answer += f"- **{source}** — Page **{page}**\n"
-
-            return answer
-
     # Normal semantic search
     question_embedding = embedding_model.encode(
         [question],
