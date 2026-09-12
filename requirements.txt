@@ -5,3 +5,6 @@ faiss-cpu
 google-genai
 langchain-text-splitters
 numpy
+pymupdf
+pytesseract
+Pillow
