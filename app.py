@@ -2,6 +2,7 @@ import streamlit as st
 import os
 import numpy as np
 import faiss
+import re
 
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
@@ -90,6 +91,92 @@ def process_pdfs(uploaded_files):
 
 def ask_pdf(question, vector_db, chunks):
 
+    # Stop words remove karke important keywords nikalna
+    stop_words = {
+        "what", "where", "when", "which", "who",
+        "how", "are", "is", "the", "a", "an",
+        "on", "in", "of", "to", "for", "and",
+        "ka", "ki", "ke", "kis", "par", "batao",
+        "hai", "hain", "kya"
+    }
+
+    clean_question = re.sub(r"[^a-zA-Z0-9\s]", " ", question.lower())
+
+    keywords = [
+        word for word in clean_question.split()
+        if len(word) >= 3 and word not in stop_words
+    ]
+
+    # Page-finding questions ke liye keyword search
+    page_question_words = {
+        "page", "pages", "pagees", "kis", "where"
+    }
+
+    is_page_question = any(
+        word in clean_question.split()
+        for word in page_question_words
+    )
+
+    if is_page_question and keywords:
+
+        matched_pages = []
+
+        for chunk in chunks:
+
+            text = chunk["text"].lower()
+
+            score = 0
+
+            for keyword in keywords:
+
+                if keyword in text:
+                    score += 1
+
+                # singular/plural matching
+                if keyword.endswith("s") and keyword[:-1] in text:
+                    score += 1
+
+                if not keyword.endswith("s") and (keyword + "s") in text:
+                    score += 1
+
+            if score > 0:
+                matched_pages.append(
+                    (
+                        score,
+                        chunk["source"],
+                        chunk["page"]
+                    )
+                )
+
+        # Highest matching pages first
+        matched_pages.sort(
+            key=lambda x: x[0],
+            reverse=True
+        )
+
+        unique_pages = []
+        seen = set()
+
+        for score, source, page in matched_pages:
+
+            key = (source, page)
+
+            if key not in seen:
+                seen.add(key)
+                unique_pages.append(
+                    (source, page)
+                )
+
+        if unique_pages:
+
+            answer = "### 📄 Relevant Pages\n\n"
+
+            for source, page in unique_pages:
+                answer += f"- **{source}** — Page **{page}**\n"
+
+            return answer
+
+    # Normal semantic search
     question_embedding = embedding_model.encode(
         [question],
         normalize_embeddings=True
@@ -102,7 +189,7 @@ def ask_pdf(question, vector_db, chunks):
 
     scores, indices = vector_db.search(
         question_embedding,
-        min(3, len(chunks))
+        min(5, len(chunks))
     )
 
     results = []
@@ -113,6 +200,7 @@ def ask_pdf(question, vector_db, chunks):
     context = ""
 
     for i, result in enumerate(results, start=1):
+
         context += f"""
 Source {i}
 Document: {result["source"]}
@@ -158,6 +246,7 @@ Give a clear and concise answer.
     sources = "\n\n### 📌 Sources\n"
 
     for result in results:
+
         sources += (
             f"- {result['source']} | "
             f"Page {result['page']}\n"
