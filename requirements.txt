@@ -1,0 +1,7 @@
+gradio
+pypdf
+sentence-transformers
+faiss-cpu
+google-genai
+langchain-text-splitters
+numpy
