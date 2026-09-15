@@ -5,7 +5,6 @@ sentence-transformers
 langchain-text-splitters
 google-genai
 pymupdf
-pypdf
 pytesseract
 Pillow
 python-docx
