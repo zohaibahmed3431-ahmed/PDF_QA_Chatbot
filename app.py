@@ -1,12 +1,17 @@
 import io
+import os
 import re
 import time
+import hashlib
+from difflib import SequenceMatcher
+
 import numpy as np
+import streamlit as st
 import faiss
 import fitz
 import pytesseract
-import streamlit as st
-from PIL import Image, ImageFilter
+
+from PIL import Image, ImageFilter, ImageOps
 from docx import Document
 from pptx import Presentation
 from openpyxl import load_workbook
@@ -14,302 +19,1891 @@ from sentence_transformers import SentenceTransformer
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from google import genai
 
-st.set_page_config(page_title='Document Q&A Assistant', page_icon='📚', layout='wide')
-st.title('📚 Document Q&A Assistant')
-st.caption('Upload documents, ask questions, and get answers with source locations.')
+
+# ============================================================
+# PAGE / APP CONFIG
+# ============================================================
+
+st.set_page_config(
+    page_title="Universal Document Q&A Assistant",
+    page_icon="📚",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.title("📚 Universal Document Q&A Assistant")
+st.caption(
+    "Upload documents, search their contents, ask questions, and get "
+    "answers with exact source locations."
+)
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
 
 with st.sidebar:
-    st.header('⚙️ Settings')
-    response_language = st.selectbox('Response Language', ['English', 'Urdu', 'Roman Urdu'])
-    st.divider()
-    st.subheader('Supported Files')
-    st.write('PDF, DOCX, TXT, PPTX, XLSX, CSV, JPG, JPEG, PNG, WEBP')
-    st.divider()
-    st.caption('The assistant answers from the uploaded files only.')
+    st.header("⚙️ Settings")
 
-@st.cache_resource
+    response_language = st.selectbox(
+        "Response Language",
+        ["English", "Urdu", "Roman Urdu"],
+    )
+
+    st.divider()
+
+    st.subheader("Supported Files")
+    st.write(
+        "PDF, scanned PDF, DOCX, TXT, PPTX, XLSX, CSV, "
+        "JPG, JPEG, PNG, WEBP"
+    )
+
+    st.divider()
+
+    st.subheader("Search Behavior")
+    st.caption(
+        "The search checks exact words, phrases, related terms, "
+        "fuzzy matches, and semantic meaning."
+    )
+
+    st.divider()
+
+    st.caption(
+        "Answers are grounded in uploaded documents. "
+        "The assistant does not invent source locations."
+    )
+
+
+# ============================================================
+# CONSTANTS
+# ============================================================
+
+SUPPORTED_EXTENSIONS = {
+    "pdf",
+    "docx",
+    "txt",
+    "pptx",
+    "xlsx",
+    "csv",
+    "jpg",
+    "jpeg",
+    "png",
+    "webp",
+}
+
+STOP_WORDS = {
+    "what", "what's", "whats", "is", "are", "the", "a", "an",
+    "of", "to", "in", "on", "for", "and", "or", "as", "at",
+    "by", "from", "with", "about", "into", "this", "that",
+    "these", "those", "it", "its", "be", "been", "being",
+    "was", "were", "do", "does", "did", "can", "could",
+    "would", "should", "will", "shall", "may", "might",
+    "how", "why", "when", "where", "which", "who", "whom",
+    "whose", "please", "tell", "me", "give", "show", "explain",
+    "define", "definition", "meaning", "discuss", "discussed",
+    "find", "locate", "page", "pages", "mentioned", "mention",
+    "related", "information", "information?", "about?",
+}
+
+SYNONYMS = {
+    "arrays": {"array"},
+    "array": {"arrays"},
+    "lists": {"list"},
+    "list": {"lists"},
+    "loops": {"loop", "iteration", "iterations"},
+    "loop": {"loops", "iteration", "iterations"},
+    "iterations": {"iteration", "loop", "loops"},
+    "functions": {"function", "method", "methods"},
+    "function": {"functions", "method", "methods"},
+    "methods": {"method", "function", "functions"},
+    "method": {"methods", "function", "functions"},
+    "classes": {"class"},
+    "class": {"classes"},
+    "objects": {"object"},
+    "object": {"objects"},
+    "variables": {"variable"},
+    "variable": {"variables"},
+    "database": {"databases", "db"},
+    "databases": {"database", "db"},
+    "error": {"errors", "exception", "exceptions"},
+    "errors": {"error", "exception", "exceptions"},
+    "exception": {"exceptions", "error", "errors"},
+    "exceptions": {"exception", "error", "errors"},
+    "functionality": {"function", "functions", "purpose", "use"},
+    "purpose": {"use", "usage", "function", "functionality"},
+    "usage": {"use", "purpose", "function"},
+    "used": {"use", "usage", "purpose"},
+    "square": {"squared", "sq"},
+    "squared": {"square"},
+    "room": {"rooms"},
+    "rooms": {"room"},
+}
+
+# A small set of common OCR confusions.
+OCR_NORMALIZATION = {
+    "0": "o",
+    "1": "l",
+    "5": "s",
+}
+
+
+# ============================================================
+# CACHED MODELS
+# ============================================================
+
+@st.cache_resource(show_spinner="Loading document search model...")
 def load_embedding_model():
-    return SentenceTransformer('all-MiniLM-L6-v2')
+    return SentenceTransformer("all-MiniLM-L6-v2")
+
 
 embedding_model = load_embedding_model()
 
 
-def check_image_quality(image):
-    gray = image.convert('L')
+# ============================================================
+# TEXT NORMALIZATION
+# ============================================================
+
+def normalize_text(text):
+    if not text:
+        return ""
+
+    text = str(text).replace("\x00", " ")
+    text = text.replace("\u00ad", "")
+    text = re.sub(r"[\u200b-\u200f\u202a-\u202e]", "", text)
+
+    # Keep words/numbers and useful punctuation.
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    return text.strip()
+
+
+def normalize_for_search(text):
+    text = normalize_text(text).lower()
+
+    # Normalize common OCR punctuation/spacing issues.
+    text = text.replace("’", "'").replace("‘", "'")
+    text = text.replace("“", '"').replace("”", '"')
+    text = re.sub(r"[-_/]+", " ", text)
+
+    # Keep letters, digits and underscores.
+    text = re.sub(r"[^a-z0-9_\s]", " ", text)
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
+
+
+def tokenize(text):
+    return re.findall(r"[a-z0-9_]+", normalize_for_search(text))
+
+
+def query_terms(question):
+    raw = tokenize(question)
+    terms = set()
+
+    for word in raw:
+        if word in STOP_WORDS:
+            continue
+
+        terms.add(word)
+
+        for related in SYNONYMS.get(word, set()):
+            terms.add(related)
+
+    return terms
+
+
+def original_query_terms(question):
+    return {
+        word
+        for word in tokenize(question)
+        if word not in STOP_WORDS
+    }
+
+
+# ============================================================
+# IMAGE / OCR
+# ============================================================
+
+def image_quality(image):
+    image = image.convert("RGB")
     width, height = image.size
+
     if width < 500 or height < 500:
-        return False, 'low_resolution'
+        return False, "low_resolution"
+
+    gray = ImageOps.grayscale(image)
+
+    # Edge variance is a simple blur indicator.
     edges = gray.filter(ImageFilter.FIND_EDGES)
-    if float(np.asarray(edges, dtype=np.float32).var()) < 20:
-        return False, 'blurry'
-    return True, 'ok'
+    variance = float(
+        np.asarray(edges, dtype=np.float32).var()
+    )
+
+    if variance < 18:
+        return False, "blurry"
+
+    # Very low contrast often means a nearly blank / unreadable image.
+    contrast = float(
+        np.asarray(gray, dtype=np.float32).std()
+    )
+
+    if contrast < 8:
+        return False, "low_contrast"
+
+    return True, "ok"
+
+
+def preprocess_for_ocr(image):
+    image = image.convert("RGB")
+
+    # Upscale smaller images for OCR.
+    w, h = image.size
+    if max(w, h) < 1800:
+        scale = 1800 / max(w, h)
+        image = image.resize(
+            (int(w * scale), int(h * scale))
+        )
+
+    gray = ImageOps.grayscale(image)
+    gray = ImageOps.autocontrast(gray)
+
+    return gray
 
 
 def perform_ocr(image):
-    for lang in ('eng+urd', 'eng'):
+    prepared = preprocess_for_ocr(image)
+
+    languages = ["eng+urd", "eng"]
+
+    for language in languages:
         try:
-            text = pytesseract.image_to_string(image, lang=lang).strip()
-            if text:
-                return text
+            text = pytesseract.image_to_string(
+                prepared,
+                lang=language,
+                config="--psm 6",
+            ).strip()
+
+            if len(text) >= 5:
+                return normalize_text(text)
         except Exception:
             pass
-    return ''
 
+    return ""
+
+
+# ============================================================
+# DOCUMENT EXTRACTORS
+# ============================================================
 
 def process_pdf(data, name):
-    docs = []
-    pdf = fitz.open(stream=data, filetype='pdf')
-    for i in range(len(pdf)):
-        page = pdf.load_page(i)
-        number = i + 1
-        text = page.get_text('text').strip()
-        if len(text) >= 30:
-            docs.append({'text': text, 'source': name, 'page': number,
-                         'location': f'{name} — Page {number}', 'method': 'text'})
-            continue
-        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-        image = Image.open(io.BytesIO(pix.tobytes('png')))
-        ok, status = check_image_quality(image)
-        if not ok:
-            docs.append({'text': '', 'source': name, 'page': number,
-                         'location': f'{name} — Page {number}', 'method': f'unreadable:{status}'})
-            continue
-        text = perform_ocr(image)
-        docs.append({'text': text if len(text) >= 10 else '', 'source': name,
-                     'page': number, 'location': f'{name} — Page {number}',
-                     'method': 'ocr' if len(text) >= 10 else 'unreadable'})
-    pdf.close()
-    return docs
+    records = []
+
+    pdf = fitz.open(stream=data, filetype="pdf")
+
+    try:
+        for index in range(len(pdf)):
+            page_number = index + 1
+            page = pdf.load_page(index)
+
+            text = normalize_text(
+                page.get_text("text")
+            )
+
+            # Normal text PDF.
+            if len(text) >= 20:
+                records.append({
+                    "text": text,
+                    "source": name,
+                    "page": page_number,
+                    "location": f"{name} — Page {page_number}",
+                    "method": "native_text",
+                    "record_id": f"{name}:{page_number}",
+                })
+                continue
+
+            # Scanned/image PDF fallback.
+            try:
+                pix = page.get_pixmap(
+                    matrix=fitz.Matrix(2.2, 2.2),
+                    alpha=False,
+                )
+
+                image = Image.open(
+                    io.BytesIO(pix.tobytes("png"))
+                ).convert("RGB")
+
+                readable, reason = image_quality(image)
+
+                if not readable:
+                    records.append({
+                        "text": "",
+                        "source": name,
+                        "page": page_number,
+                        "location": f"{name} — Page {page_number}",
+                        "method": f"unreadable:{reason}",
+                        "record_id": f"{name}:{page_number}",
+                    })
+                    continue
+
+                ocr_text = perform_ocr(image)
+
+                if len(ocr_text) >= 10:
+                    records.append({
+                        "text": ocr_text,
+                        "source": name,
+                        "page": page_number,
+                        "location": f"{name} — Page {page_number}",
+                        "method": "ocr",
+                        "record_id": f"{name}:{page_number}",
+                    })
+                else:
+                    records.append({
+                        "text": "",
+                        "source": name,
+                        "page": page_number,
+                        "location": f"{name} — Page {page_number}",
+                        "method": "unreadable:ocr_failed",
+                        "record_id": f"{name}:{page_number}",
+                    })
+
+            except Exception as exc:
+                records.append({
+                    "text": "",
+                    "source": name,
+                    "page": page_number,
+                    "location": f"{name} — Page {page_number}",
+                    "method": "unreadable:pdf_render_error",
+                    "error": str(exc),
+                    "record_id": f"{name}:{page_number}",
+                })
+
+    finally:
+        pdf.close()
+
+    return records
 
 
 def process_docx(data, name):
-    docs = []
-    doc = Document(io.BytesIO(data))
-    pno = 0
-    for p in doc.paragraphs:
-        text = p.text.strip()
+    records = []
+
+    document = Document(io.BytesIO(data))
+
+    paragraph_number = 0
+
+    for paragraph in document.paragraphs:
+        text = normalize_text(paragraph.text)
+
         if text:
-            pno += 1
-            docs.append({'text': text, 'source': name, 'page': None,
-                         'location': f'{name} — Paragraph {pno}', 'method': 'text'})
-    for ti, table in enumerate(doc.tables, 1):
-        for ri, row in enumerate(table.rows, 1):
-            text = ' | '.join(c.text.strip() for c in row.cells if c.text.strip())
-            if text:
-                docs.append({'text': text, 'source': name, 'page': None,
-                             'location': f'{name} — Table {ti}, Row {ri}', 'method': 'table'})
-    return docs
+            paragraph_number += 1
+
+            records.append({
+                "text": text,
+                "source": name,
+                "page": None,
+                "location": (
+                    f"{name} — Paragraph {paragraph_number}"
+                ),
+                "method": "text",
+                "record_id": (
+                    f"{name}:paragraph:{paragraph_number}"
+                ),
+            })
+
+    for table_number, table in enumerate(
+        document.tables, start=1
+    ):
+        for row_number, row in enumerate(
+            table.rows, start=1
+        ):
+            values = []
+
+            for cell in row.cells:
+                value = normalize_text(cell.text)
+                if value:
+                    values.append(value)
+
+            row_text = " | ".join(values)
+
+            if row_text:
+                records.append({
+                    "text": row_text,
+                    "source": name,
+                    "page": None,
+                    "location": (
+                        f"{name} — Table {table_number}, "
+                        f"Row {row_number}"
+                    ),
+                    "method": "table",
+                    "record_id": (
+                        f"{name}:table:{table_number}:"
+                        f"{row_number}"
+                    ),
+                })
+
+    return records
 
 
 def process_text(data, name):
-    text = data.decode('utf-8', errors='ignore').strip()
-    return [{'text': text, 'source': name, 'page': None, 'location': name, 'method': 'text'}] if text else []
+    text = data.decode(
+        "utf-8",
+        errors="ignore",
+    )
+
+    text = normalize_text(text)
+
+    if not text:
+        return []
+
+    return [{
+        "text": text,
+        "source": name,
+        "page": None,
+        "location": name,
+        "method": "text",
+        "record_id": f"{name}:text",
+    }]
 
 
 def process_pptx(data, name):
-    docs = []
-    pres = Presentation(io.BytesIO(data))
-    for sn, slide in enumerate(pres.slides, 1):
-        texts = [shape.text.strip() for shape in slide.shapes if hasattr(shape, 'text') and shape.text.strip()]
-        text = '\n'.join(texts)
-        if text:
-            docs.append({'text': text, 'source': name, 'page': sn,
-                         'location': f'{name} — Slide {sn}', 'method': 'text'})
-    return docs
+    records = []
+
+    presentation = Presentation(
+        io.BytesIO(data)
+    )
+
+    for slide_number, slide in enumerate(
+        presentation.slides,
+        start=1,
+    ):
+        texts = []
+
+        for shape in slide.shapes:
+            try:
+                if hasattr(shape, "text"):
+                    value = normalize_text(shape.text)
+                    if value:
+                        texts.append(value)
+            except Exception:
+                pass
+
+        slide_text = "\n".join(texts)
+
+        if slide_text:
+            records.append({
+                "text": slide_text,
+                "source": name,
+                "page": slide_number,
+                "location": (
+                    f"{name} — Slide {slide_number}"
+                ),
+                "method": "text",
+                "record_id": (
+                    f"{name}:slide:{slide_number}"
+                ),
+            })
+
+    return records
 
 
 def process_xlsx(data, name):
-    docs = []
-    wb = load_workbook(io.BytesIO(data), data_only=True)
-    for sheet in wb.worksheets:
-        for rn, row in enumerate(sheet.iter_rows(values_only=True), 1):
-            text = ' | '.join(str(v) for v in row if v is not None)
-            if text.strip():
-                docs.append({'text': text, 'source': name, 'page': None,
-                             'location': f"{name} — Sheet '{sheet.title}', Row {rn}", 'method': 'spreadsheet'})
-    return docs
+    records = []
+
+    workbook = load_workbook(
+        io.BytesIO(data),
+        data_only=True,
+        read_only=True,
+    )
+
+    try:
+        for sheet in workbook.worksheets:
+            for row_number, row in enumerate(
+                sheet.iter_rows(values_only=True),
+                start=1,
+            ):
+                values = []
+
+                for value in row:
+                    if value is not None:
+                        value = normalize_text(str(value))
+                        if value:
+                            values.append(value)
+
+                row_text = " | ".join(values)
+
+                if row_text:
+                    records.append({
+                        "text": row_text,
+                        "source": name,
+                        "page": None,
+                        "location": (
+                            f"{name} — Sheet "
+                            f"'{sheet.title}', Row {row_number}"
+                        ),
+                        "method": "spreadsheet",
+                        "record_id": (
+                            f"{name}:sheet:{sheet.title}:"
+                            f"row:{row_number}"
+                        ),
+                    })
+    finally:
+        workbook.close()
+
+    return records
 
 
 def process_image(data, name):
-    image = Image.open(io.BytesIO(data))
-    ok, status = check_image_quality(image)
-    if not ok:
-        return [{'text': '', 'source': name, 'page': None, 'location': name, 'method': f'unreadable:{status}'}]
+    image = Image.open(
+        io.BytesIO(data)
+    ).convert("RGB")
+
+    readable, reason = image_quality(image)
+
+    if not readable:
+        return [{
+            "text": "",
+            "source": name,
+            "page": None,
+            "location": name,
+            "method": f"unreadable:{reason}",
+            "record_id": f"{name}:image",
+        }]
+
     text = perform_ocr(image)
-    return [{'text': text, 'source': name, 'page': None, 'location': name, 'method': 'ocr'}] if text else \
-           [{'text': '', 'source': name, 'page': None, 'location': name, 'method': 'unreadable'}]
+
+    if text:
+        return [{
+            "text": text,
+            "source": name,
+            "page": None,
+            "location": name,
+            "method": "ocr",
+            "record_id": f"{name}:image",
+        }]
+
+    return [{
+        "text": "",
+        "source": name,
+        "page": None,
+        "location": name,
+        "method": "unreadable:ocr_failed",
+        "record_id": f"{name}:image",
+    }]
 
 
-def extract_documents(files):
-    docs, unreadable = [], []
-    for f in files:
-        name, data = f.name, f.getvalue()
-        ext = name.lower().rsplit('.', 1)[-1]
+def extract_documents(uploaded_files):
+    readable_records = []
+    unreadable_records = []
+
+    for uploaded in uploaded_files:
+        name = uploaded.name
+        extension = (
+            name.lower().rsplit(".", 1)[-1]
+            if "." in name
+            else ""
+        )
+
+        data = uploaded.getvalue()
+
         try:
-            if ext == 'pdf': new = process_pdf(data, name)
-            elif ext == 'docx': new = process_docx(data, name)
-            elif ext in {'txt', 'csv'}: new = process_text(data, name)
-            elif ext == 'pptx': new = process_pptx(data, name)
-            elif ext == 'xlsx': new = process_xlsx(data, name)
-            elif ext in {'jpg', 'jpeg', 'png', 'webp'}: new = process_image(data, name)
-            else: new = []
-            for d in new:
-                (docs if d['text'].strip() else unreadable).append(d)
-        except Exception as e:
-            unreadable.append({'source': name, 'page': None, 'location': name, 'method': 'error', 'error': str(e), 'text': ''})
-    return docs, unreadable
+            if extension == "pdf":
+                new_records = process_pdf(
+                    data,
+                    name,
+                )
+
+            elif extension == "docx":
+                new_records = process_docx(
+                    data,
+                    name,
+                )
+
+            elif extension in {"txt", "csv"}:
+                new_records = process_text(
+                    data,
+                    name,
+                )
+
+            elif extension == "pptx":
+                new_records = process_pptx(
+                    data,
+                    name,
+                )
+
+            elif extension == "xlsx":
+                new_records = process_xlsx(
+                    data,
+                    name,
+                )
+
+            elif extension in {
+                "jpg",
+                "jpeg",
+                "png",
+                "webp",
+            }:
+                new_records = process_image(
+                    data,
+                    name,
+                )
+
+            else:
+                new_records = []
+
+            for record in new_records:
+                if normalize_text(record.get("text", "")):
+                    readable_records.append(record)
+                else:
+                    unreadable_records.append(record)
+
+        except Exception as exc:
+            unreadable_records.append({
+                "text": "",
+                "source": name,
+                "page": None,
+                "location": name,
+                "method": "error",
+                "error": str(exc),
+                "record_id": f"{name}:error",
+            })
+
+    return readable_records, unreadable_records
 
 
-def build_vector_database(docs):
-    splitter = RecursiveCharacterTextSplitter(chunk_size=700, chunk_overlap=100)
+# ============================================================
+# CHUNKING / VECTOR DATABASE
+# ============================================================
+
+def build_chunks(records):
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=850,
+        chunk_overlap=140,
+        separators=[
+            "\n\n",
+            "\n",
+            ". ",
+            "? ",
+            "! ",
+            "; ",
+            ", ",
+            " ",
+        ],
+    )
+
     chunks = []
-    for d in docs:
-        for text in splitter.split_text(d['text']):
-            if text.strip():
-                chunks.append({**{k: d[k] for k in ('source','page','location','method')}, 'text': text})
+
+    for record in records:
+        pieces = splitter.split_text(
+            normalize_text(record["text"])
+        )
+
+        for piece_number, piece in enumerate(
+            pieces,
+            start=1,
+        ):
+            piece = normalize_text(piece)
+
+            if not piece:
+                continue
+
+            chunks.append({
+                "text": piece,
+                "source": record["source"],
+                "page": record["page"],
+                "location": record["location"],
+                "method": record["method"],
+                "record_id": record["record_id"],
+                "chunk_number": piece_number,
+            })
+
+    return chunks
+
+
+def build_vector_database(chunks):
     if not chunks:
-        return None, []
-    emb = embedding_model.encode([c['text'] for c in chunks], normalize_embeddings=True, show_progress_bar=False)
-    emb = np.asarray(emb, dtype='float32')
-    index = faiss.IndexFlatIP(emb.shape[1])
-    index.add(emb)
-    return index, chunks
+        return None
 
-STOP = {'what','is','are','the','a','an','of','to','in','on','for','and','or','how','where','when','why','which','who','does','do','did','can','could','would','please','tell','me','about','discussed','discuss','explain','define','definition','give','show'}
-SYN = {'arrays': {'array'}, 'array': {'arrays'}, 'loops': {'loop','iteration','iterations'}, 'loop': {'loops','iteration','iterations'},
-       'functions': {'function','method','methods'}, 'function': {'functions','method','methods'}, 'classes': {'class'}, 'class': {'classes'},
-       'lists': {'list'}, 'list': {'lists'}, 'dictionaries': {'dictionary','dict'}, 'dictionary': {'dictionaries','dict'}}
+    texts = [chunk["text"] for chunk in chunks]
 
+    embeddings = embedding_model.encode(
+        texts,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+        batch_size=32,
+    )
 
-def terms(question):
-    out = set()
-    for w in re.findall(r'[A-Za-z0-9_]+', question.lower()):
-        if w not in STOP:
-            out.add(w)
-            out.update(SYN.get(w, set()))
-    return out
+    embeddings = np.asarray(
+        embeddings,
+        dtype="float32",
+    )
 
+    index = faiss.IndexFlatIP(
+        embeddings.shape[1]
+    )
 
-def lexical_score(question, text):
-    q = terms(question)
-    if not q: return 0.0
-    t = set(re.findall(r'[A-Za-z0-9_]+', text.lower()))
-    return len(q & t) / len(q)
+    index.add(embeddings)
+
+    return index
 
 
-def search_documents(question, index, chunks, k=12):
-    qemb = embedding_model.encode([question], normalize_embeddings=True, show_progress_bar=False)
-    qemb = np.asarray(qemb, dtype='float32')
-    scores, ids = index.search(qemb, min(k, len(chunks)))
-    out = []
-    for score, idx in zip(scores[0], ids[0]):
-        if idx < 0: continue
-        r = dict(chunks[idx])
-        r['semantic_score'] = float(score)
-        r['lexical_score'] = lexical_score(question, r['text'])
-        r['combined_score'] = 0.80 * r['semantic_score'] + 0.20 * r['lexical_score']
-        out.append(r)
-    return sorted(out, key=lambda x: x['combined_score'], reverse=True)
+# ============================================================
+# SEARCH SCORING
+# ============================================================
+
+def exact_phrase_score(question, text):
+    q = normalize_for_search(question)
+    t = normalize_for_search(text)
+
+    if not q or not t:
+        return 0.0
+
+    if q in t:
+        return 1.0
+
+    # Also check compact phrase with stop words removed.
+    q_words = [
+        word
+        for word in tokenize(question)
+        if word not in STOP_WORDS
+    ]
+
+    if len(q_words) >= 2:
+        compact = " ".join(q_words)
+        if compact in t:
+            return 0.90
+
+    return 0.0
 
 
-def relevant_results(question, candidates):
-    if not candidates: return []
-    top = candidates[0]
-    if top['lexical_score'] < 0.50 and top['semantic_score'] < 0.48:
+def term_match_score(question, text):
+    q = query_terms(question)
+
+    if not q:
+        return 0.0
+
+    text_tokens = set(tokenize(text))
+
+    exact_matches = q & text_tokens
+
+    return len(exact_matches) / max(len(q), 1)
+
+
+def original_term_score(question, text):
+    q = original_query_terms(question)
+
+    if not q:
+        return 0.0
+
+    text_tokens = set(tokenize(text))
+
+    matches = q & text_tokens
+
+    return len(matches) / max(len(q), 1)
+
+
+def fuzzy_term_score(question, text):
+    q = original_query_terms(question)
+
+    if not q:
+        return 0.0
+
+    text_tokens = list(set(tokenize(text)))
+
+    if not text_tokens:
+        return 0.0
+
+    matched = 0
+
+    for query_word in q:
+        best = 0.0
+
+        # Exact first.
+        if query_word in text_tokens:
+            best = 1.0
+        else:
+            # Only compare reasonably short token sets.
+            for text_word in text_tokens[:3000]:
+                ratio = SequenceMatcher(
+                    None,
+                    query_word,
+                    text_word,
+                ).ratio()
+
+                if ratio > best:
+                    best = ratio
+
+        # Fuzzy threshold deliberately allows OCR spelling errors,
+        # but not completely unrelated words.
+        if (
+            len(query_word) <= 4 and best >= 0.84
+        ) or (
+            len(query_word) > 4 and best >= 0.76
+        ):
+            matched += 1
+
+    return matched / max(len(q), 1)
+
+
+def make_search_signature(question):
+    words = query_terms(question)
+
+    # Used to detect short lookup-style questions.
+    return words
+
+
+def is_lookup_query(question):
+    words = tokenize(question)
+
+    if not words:
+        return False
+
+    meaningful = original_query_terms(question)
+
+    explicit_lookup_words = {
+        "where",
+        "page",
+        "pages",
+        "find",
+        "locate",
+        "mentioned",
+        "mention",
+        "discussed",
+        "discuss",
+        "located",
+        "appears",
+        "appeared",
+        "contains",
+        "contain",
+        "shown",
+        "shows",
+    }
+
+    if any(
+        word in explicit_lookup_words
+        for word in words
+    ):
+        return True
+
+    # Very short phrases are often direct searches,
+    # e.g. "type c 3 rooms square fit".
+    if len(meaningful) <= 8:
+        return True
+
+    return False
+
+
+def semantic_search(question, index, chunks, limit=24):
+    if index is None or not chunks:
         return []
-    return [r for r in candidates if r['combined_score'] >= 0.40 and (r['semantic_score'] >= 0.40 or r['lexical_score'] >= 0.50)][:6]
 
+    query_embedding = embedding_model.encode(
+        [question],
+        normalize_embeddings=True,
+        show_progress_bar=False,
+    )
+
+    query_embedding = np.asarray(
+        query_embedding,
+        dtype="float32",
+    )
+
+    k = min(limit, len(chunks))
+
+    scores, indices = index.search(
+        query_embedding,
+        k,
+    )
+
+    results = []
+
+    for score, idx in zip(
+        scores[0],
+        indices[0],
+    ):
+        if idx < 0:
+            continue
+
+        result = dict(chunks[idx])
+
+        result["semantic_score"] = float(score)
+
+        results.append(result)
+
+    return results
+
+
+def all_content_search(question, chunks):
+    """
+    Exhaustive lexical/fuzzy search over EVERY chunk.
+
+    This is important:
+    even when the semantic top-k misses a page, an exact word,
+    phrase, synonym, or OCR-near word can still be found.
+    """
+
+    scored = []
+
+    for chunk in chunks:
+        text = chunk["text"]
+
+        phrase = exact_phrase_score(
+            question,
+            text,
+        )
+
+        original = original_term_score(
+            question,
+            text,
+        )
+
+        related = term_match_score(
+            question,
+            text,
+        )
+
+        fuzzy = fuzzy_term_score(
+            question,
+            text,
+        )
+
+        # Strong preference for exact phrase and actual query words.
+        lexical = (
+            0.42 * phrase
+            + 0.35 * original
+            + 0.15 * related
+            + 0.08 * fuzzy
+        )
+
+        if lexical > 0:
+            result = dict(chunk)
+
+            result["phrase_score"] = phrase
+            result["original_term_score"] = original
+            result["related_term_score"] = related
+            result["fuzzy_score"] = fuzzy
+            result["lexical_total"] = lexical
+
+            scored.append(result)
+
+    return sorted(
+        scored,
+        key=lambda item: (
+            item["lexical_total"],
+            item["original_term_score"],
+            item["phrase_score"],
+        ),
+        reverse=True,
+    )
+
+
+def merge_search_results(
+    semantic_results,
+    lexical_results,
+):
+    merged = {}
+
+    for result in semantic_results:
+        key = result["record_id"] + "|" + str(
+            result.get("chunk_number", 0)
+        )
+
+        merged[key] = dict(result)
+
+    for result in lexical_results:
+        key = result["record_id"] + "|" + str(
+            result.get("chunk_number", 0)
+        )
+
+        if key not in merged:
+            merged[key] = dict(result)
+
+        else:
+            existing = merged[key]
+
+            for field in (
+                "phrase_score",
+                "original_term_score",
+                "related_term_score",
+                "fuzzy_score",
+                "lexical_total",
+            ):
+                if field in result:
+                    existing[field] = result[field]
+
+    return list(merged.values())
+
+
+def score_combined_results(
+    question,
+    results,
+):
+    rescored = []
+
+    for result in results:
+        semantic = float(
+            result.get("semantic_score", 0.0)
+        )
+
+        phrase = float(
+            result.get("phrase_score", 0.0)
+        )
+
+        original = float(
+            result.get("original_term_score", 0.0)
+        )
+
+        related = float(
+            result.get("related_term_score", 0.0)
+        )
+
+        fuzzy = float(
+            result.get("fuzzy_score", 0.0)
+        )
+
+        # Semantic + lexical hybrid.
+        score = (
+            0.34 * semantic
+            + 0.30 * phrase
+            + 0.20 * original
+            + 0.10 * related
+            + 0.06 * fuzzy
+        )
+
+        # Exact phrase should be nearly unbeatable.
+        if phrase >= 0.90:
+            score += 0.35
+
+        # Exact word match should be strongly preferred.
+        if original >= 1.0:
+            score += 0.20
+
+        result = dict(result)
+        result["final_score"] = score
+
+        rescored.append(result)
+
+    return sorted(
+        rescored,
+        key=lambda item: item["final_score"],
+        reverse=True,
+    )
+
+
+def find_relevant_results(
+    question,
+    index,
+    chunks,
+):
+    if not chunks:
+        return []
+
+    semantic_results = semantic_search(
+        question,
+        index,
+        chunks,
+        limit=min(30, len(chunks)),
+    )
+
+    lexical_results = all_content_search(
+        question,
+        chunks,
+    )
+
+    merged = merge_search_results(
+        semantic_results,
+        lexical_results,
+    )
+
+    ranked = score_combined_results(
+        question,
+        merged,
+    )
+
+    query_words = original_query_terms(
+        question
+    )
+
+    # If the user supplied meaningful words and at least one of them
+    # exists in the document, we WANT to return that evidence.
+    # This directly implements the requested "even one related word"
+    # behavior.
+    direct_matches = []
+
+    for result in lexical_results:
+        if (
+            result["original_term_score"] > 0
+            or result["phrase_score"] > 0
+            or result["fuzzy_score"] >= 0.5
+        ):
+            direct_matches.append(result)
+
+    # Prefer exact lexical evidence before semantic-only evidence.
+    direct_matches = score_combined_results(
+        question,
+        direct_matches,
+    )
+
+    selected = []
+
+    seen_chunks = set()
+
+    # First include strong direct matches.
+    for result in direct_matches:
+        key = (
+            result["record_id"],
+            result.get("chunk_number"),
+        )
+
+        if key in seen_chunks:
+            continue
+
+        seen_chunks.add(key)
+        selected.append(result)
+
+        if len(selected) >= 10:
+            break
+
+    # Then add useful semantic matches.
+    for result in ranked:
+        key = (
+            result["record_id"],
+            result.get("chunk_number"),
+        )
+
+        if key in seen_chunks:
+            continue
+
+        # Semantic-only results need a reasonable score.
+        # We do NOT allow unrelated random pages.
+        if (
+            result.get("semantic_score", 0.0) >= 0.52
+        ):
+            seen_chunks.add(key)
+            selected.append(result)
+
+        if len(selected) >= 10:
+            break
+
+    # If there are zero lexical matches and semantic confidence is weak,
+    # report no reliable match rather than inventing one.
+    if not direct_matches:
+        strong_semantic = [
+            item
+            for item in ranked
+            if item.get("semantic_score", 0.0) >= 0.58
+        ]
+
+        if not strong_semantic:
+            return []
+
+    return selected[:10]
+
+
+# ============================================================
+# LOCATION GROUPING
+# ============================================================
+
+def group_sources(results, max_sources=8):
+    groups = []
+    seen = set()
+
+    for result in results:
+        location = result["location"]
+
+        if location in seen:
+            continue
+
+        seen.add(location)
+        groups.append(result)
+
+        if len(groups) >= max_sources:
+            break
+
+    return groups
+
+
+def source_markdown(results, max_sources=8):
+    sources = group_sources(
+        results,
+        max_sources=max_sources,
+    )
+
+    if not sources:
+        return ""
+
+    lines = ["### 📌 Sources"]
+
+    for result in sources:
+        lines.append(
+            f"- **{result['location']}**"
+        )
+
+    return "\n".join(lines)
+
+
+def excerpt_for_result(result, question):
+    text = normalize_text(result["text"])
+
+    if len(text) <= 650:
+        return text
+
+    query_words = list(
+        original_query_terms(question)
+    )
+
+    lowered = normalize_for_search(text)
+
+    positions = []
+
+    for word in query_words:
+        pos = lowered.find(
+            normalize_for_search(word)
+        )
+
+        if pos >= 0:
+            positions.append(pos)
+
+    if positions:
+        center = min(positions)
+    else:
+        center = 0
+
+    start = max(
+        0,
+        center - 220,
+    )
+
+    end = min(
+        len(text),
+        start + 650,
+    )
+
+    excerpt = text[start:end]
+
+    if start > 0:
+        excerpt = "..." + excerpt
+
+    if end < len(text):
+        excerpt += "..."
+
+    return excerpt
+
+
+# ============================================================
+# LANGUAGE
+# ============================================================
 
 def language_instruction(language):
-    if language == 'Urdu': return 'Answer entirely in Urdu script. Do not use Roman Urdu. Use English only for necessary technical terms.'
-    if language == 'Roman Urdu': return 'Answer entirely in Roman Urdu. Do not use Urdu script. Use English only for necessary technical terms.'
-    return 'Answer entirely in English.'
+    if language == "Urdu":
+        return (
+            "Answer entirely in Urdu script. "
+            "Do not answer in Roman Urdu. "
+            "Keep necessary technical terms in English."
+        )
+
+    if language == "Roman Urdu":
+        return (
+            "Answer entirely in Roman Urdu using Latin letters. "
+            "Do not use Urdu script. "
+            "Keep necessary technical terms in English."
+        )
+
+    return "Answer entirely in English."
 
 
-def generate_answer(prompt):
+def not_found_message(language):
+    if language == "Urdu":
+        return (
+            "مجھے اپ لوڈ کی گئی فائلوں میں اس سوال سے متعلق "
+            "قابلِ اعتماد مواد نہیں ملا۔"
+        )
+
+    if language == "Roman Urdu":
+        return (
+            "Mujhe upload ki gayi files mein is sawal se "
+            "related koi reliable content nahi mila."
+        )
+
+    return (
+        "I could not find reliable content related to this "
+        "question in the uploaded files."
+    )
+
+
+# ============================================================
+# GEMINI
+# ============================================================
+
+def get_api_key():
     try:
-        key = st.secrets['GEMINI_API_KEY']
+        key = st.secrets.get("GEMINI_API_KEY")
+
+        if key:
+            return key
     except Exception:
-        return None, 'Gemini API key is not configured. Please add GEMINI_API_KEY in Streamlit Secrets.'
-    client = genai.Client(api_key=key)
-    last = ''
-    for model in ('gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash'):
+        pass
+
+    return os.environ.get("GEMINI_API_KEY")
+
+
+def generate_ai_answer(
+    question,
+    results,
+    language,
+):
+    key = get_api_key()
+
+    if not key:
+        return None, (
+            "Gemini API key is not configured."
+        )
+
+    context_parts = []
+
+    for number, result in enumerate(
+        results,
+        start=1,
+    ):
+        context_parts.append(
+            f"""
+SOURCE {number}
+Location: {result['location']}
+Document: {result['source']}
+
+CONTENT:
+{result['text']}
+------------------------------
+"""
+        )
+
+    context = "\n".join(
+        context_parts
+    )
+
+    prompt = f"""
+You are a professional Universal Document Q&A Assistant.
+
+The uploaded documents are the ONLY authority.
+
+USER QUESTION:
+{question}
+
+RESPONSE LANGUAGE:
+{language}
+
+LANGUAGE RULE:
+{language_instruction(language)}
+
+DOCUMENT CONTEXT:
+{context}
+
+STRICT RULES:
+1. Answer the user's actual question.
+2. Use only information supported by the document context.
+3. Never invent facts.
+4. Never invent page numbers, locations, measurements, names,
+   definitions, examples, or other document details.
+5. If the question asks what something means, explain its meaning
+   only when the document supports it.
+6. If the question asks the purpose, use, function, reason, or
+   significance of something, explain it only from the document.
+7. If the user asks where something is discussed, clearly identify
+   the relevant source location(s).
+8. If only a small amount of relevant information is present,
+   say exactly what the document supports instead of pretending
+   the document says more.
+9. Do not mention sources that do not support your answer.
+10. Do not use outside knowledge to fill gaps.
+11. Keep the answer clear and useful.
+"""
+
+    client = genai.Client(
+        api_key=key
+    )
+
+    # Stable/current-compatible fallbacks.
+    models = [
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+    ]
+
+    last_error = ""
+
+    for model in models:
         for attempt in range(2):
             try:
-                response = client.models.generate_content(model=model, contents=prompt)
-                if response.text and response.text.strip(): return response.text.strip(), None
-                last = f'{model} returned an empty response.'
-            except Exception as e:
-                last = str(e)
-                transient = any(x in last for x in ('429','500','502','503','504','UNAVAILABLE','RESOURCE_EXHAUSTED'))
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                )
+
+                text = getattr(
+                    response,
+                    "text",
+                    None,
+                )
+
+                if text and text.strip():
+                    return text.strip(), None
+
+                last_error = (
+                    f"{model} returned an empty response."
+                )
+
+            except Exception as exc:
+                last_error = str(exc)
+
+                transient = any(
+                    marker in last_error
+                    for marker in (
+                        "429",
+                        "500",
+                        "502",
+                        "503",
+                        "504",
+                        "UNAVAILABLE",
+                        "RESOURCE_EXHAUSTED",
+                        "DEADLINE_EXCEEDED",
+                    )
+                )
+
                 if transient and attempt == 0:
                     time.sleep(2)
                     continue
+
                 break
-    return None, 'The AI service is temporarily unavailable. Please try again in a moment.\n\nTechnical detail: ' + last
+
+    return None, (
+        "AI explanation is temporarily unavailable. "
+        f"Technical detail: {last_error}"
+    )
 
 
-def ask_documents(question, index, chunks, language):
-    candidates = search_documents(question, index, chunks)
-    results = relevant_results(question, candidates)
+# ============================================================
+# DETERMINISTIC FALLBACK
+# ============================================================
+
+def deterministic_answer(
+    question,
+    results,
+    language,
+):
+    """
+    This is deliberately extractive.
+
+    If Gemini is unavailable, the app still:
+    - confirms relevant content exists,
+    - gives the source/page,
+    - shows the actual matched passage.
+
+    It does NOT invent an explanation.
+    """
+
     if not results:
-        if language == 'Urdu': return 'مجھے اپ لوڈ کی گئی فائلوں میں اس سوال کا قابلِ اعتماد جواب نہیں ملا۔'
-        if language == 'Roman Urdu': return 'Mujhe upload ki gayi files mein is sawal ka reliable jawab nahi mila.'
-        return "I couldn't find reliable information about this question in the uploaded files."
+        return not_found_message(
+            language
+        )
 
-    context = '\n'.join(f"SOURCE {i}\nLocation: {r['location']}\nContent:\n{r['text']}\n----------------" for i, r in enumerate(results, 1))
-    prompt = f'''You are a professional document Q&A assistant.\n\nAnswer ONLY from the supplied document context.\n1. Never use outside knowledge to fill a missing answer.\n2. Never invent facts, definitions, examples, page numbers, or sources.\n3. If the context does not support the answer, say that it could not be found in the uploaded files.\n4. Answer the user's actual question directly.\n5. Explain clearly when the document provides enough information.\n6. Use ONLY the selected response language.\n7. Do not cite a source unless its content actually supports the answer.\n8. If asked where a topic is discussed, identify relevant source locations from the context.\n\nSelected language: {language}\n{language_instruction(language)}\n\nUSER QUESTION:\n{question}\n\nDOCUMENT CONTEXT:\n{context}'''
-    answer, error = generate_answer(prompt)
-    if error: return error
-    seen, sources = set(), []
-    for r in results:
-        if r['location'] not in seen:
-            seen.add(r['location']); sources.append(f"- **{r['location']}**")
-    return answer + '\n\n### 📌 Sources\n\n' + '\n'.join(sources)
+    top = results[0]
+    excerpt = excerpt_for_result(
+        top,
+        question,
+    )
 
-if 'vector_db' not in st.session_state: st.session_state.vector_db = None
-if 'chunks' not in st.session_state: st.session_state.chunks = []
-if 'unreadable_files' not in st.session_state: st.session_state.unreadable_files = []
+    if language == "Urdu":
+        answer = (
+            "فائل میں اس سوال سے متعلق مواد ملا ہے۔ "
+            "متعلقہ جگہ نیچے دی گئی ہے۔\n\n"
+            f"متعلقہ مواد:\n{excerpt}"
+        )
 
-uploaded_files = st.file_uploader('📁 Upload your files', type=['pdf','docx','txt','pptx','xlsx','csv','jpg','jpeg','png','webp'], accept_multiple_files=True)
+    elif language == "Roman Urdu":
+        answer = (
+            "File mein is sawal se related content mila hai. "
+            "Relevant location neeche di gayi hai.\n\n"
+            f"Relevant content:\n{excerpt}"
+        )
 
-if st.button('⚙️ Process Files', use_container_width=True):
-    if not uploaded_files:
-        st.warning('Please upload at least one file.')
     else:
-        with st.spinner('Processing files...'):
-            docs, unreadable = extract_documents(uploaded_files)
-            index, chunks = build_vector_database(docs)
-            st.session_state.vector_db = index
-            st.session_state.chunks = chunks
-            st.session_state.unreadable_files = unreadable
-        if index is not None:
-            st.success(f'Processed {len(uploaded_files)} file(s) successfully. {len(chunks)} searchable chunks created.')
+        answer = (
+            "Relevant content was found in the uploaded file. "
+            "The matched passage is shown below.\n\n"
+            f"Relevant content:\n{excerpt}"
+        )
+
+    return answer
+
+
+# ============================================================
+# FINAL QUESTION HANDLER
+# ============================================================
+
+def answer_question(
+    question,
+    index,
+    chunks,
+    language,
+):
+    question = normalize_text(question)
+
+    if not question:
+        return "Please enter a question."
+
+    results = find_relevant_results(
+        question,
+        index,
+        chunks,
+    )
+
+    if not results:
+        return not_found_message(
+            language
+        )
+
+    lookup_mode = is_lookup_query(
+        question
+    )
+
+    # --------------------------------------------------------
+    # LOOKUP MODE
+    # --------------------------------------------------------
+    # For questions like:
+    # "where is array?"
+    # "page of loops?"
+    # "type c 3 rooms square fit"
+    #
+    # Source detection is completed BEFORE Gemini.
+    # Therefore Gemini 503 cannot hide the source.
+    # --------------------------------------------------------
+
+    if lookup_mode:
+        ai_answer, ai_error = generate_ai_answer(
+            question,
+            results[:6],
+            language,
+        )
+
+        if ai_answer:
+            answer = ai_answer
         else:
-            st.error('No readable content could be extracted from the uploaded files.')
+            answer = deterministic_answer(
+                question,
+                results,
+                language,
+            )
+
+            if language == "Urdu":
+                answer += (
+                    "\n\nAI explanation اس وقت دستیاب نہیں، "
+                    "لیکن document search نے متعلقہ مواد تلاش کر لیا ہے۔"
+                )
+
+            elif language == "Roman Urdu":
+                answer += (
+                    "\n\nAI explanation is waqt available nahi, "
+                    "lekin document search ne relevant content "
+                    "find kar liya hai."
+                )
+
+            else:
+                answer += (
+                    "\n\nAI explanation is temporarily unavailable, "
+                    "but the document search successfully found the "
+                    "relevant content."
+                )
+
+        return (
+            answer
+            + "\n\n"
+            + source_markdown(
+                results,
+                max_sources=8,
+            )
+        )
+
+    # --------------------------------------------------------
+    # NORMAL Q&A MODE
+    # --------------------------------------------------------
+
+    ai_answer, ai_error = generate_ai_answer(
+        question,
+        results[:6],
+        language,
+    )
+
+    if ai_answer:
+        return (
+            ai_answer
+            + "\n\n"
+            + source_markdown(
+                results,
+                max_sources=8,
+            )
+        )
+
+    # Gemini unavailable:
+    # NEVER say "not found" because we already found evidence.
+    fallback = deterministic_answer(
+        question,
+        results,
+        language,
+    )
+
+    if language == "Urdu":
+        fallback += (
+            "\n\nAI explanation اس وقت دستیاب نہیں، "
+            "لیکن document میں متعلقہ مواد موجود ہے۔"
+        )
+
+    elif language == "Roman Urdu":
+        fallback += (
+            "\n\nAI explanation is waqt available nahi, "
+            "lekin document mein relevant content mojood hai."
+        )
+
+    else:
+        fallback += (
+            "\n\nAI explanation is temporarily unavailable, "
+            "but relevant content is present in the document."
+        )
+
+    return (
+        fallback
+        + "\n\n"
+        + source_markdown(
+            results,
+            max_sources=8,
+        )
+    )
+
+
+# ============================================================
+# SESSION STATE
+# ============================================================
+
+if "vector_db" not in st.session_state:
+    st.session_state.vector_db = None
+
+if "chunks" not in st.session_state:
+    st.session_state.chunks = []
+
+if "unreadable_files" not in st.session_state:
+    st.session_state.unreadable_files = []
+
+if "processed_signature" not in st.session_state:
+    st.session_state.processed_signature = None
+
+
+# ============================================================
+# FILE UPLOAD
+# ============================================================
+
+uploaded_files = st.file_uploader(
+    "📁 Upload your documents",
+    type=sorted(
+        SUPPORTED_EXTENSIONS
+    ),
+    accept_multiple_files=True,
+    help=(
+        "You can upload PDFs, scanned PDFs, Word files, "
+        "PowerPoint files, spreadsheets, text files, or images."
+    ),
+)
+
+
+# ============================================================
+# PROCESS BUTTON
+# ============================================================
+
+if st.button(
+    "⚙️ Process Files",
+    use_container_width=True,
+):
+    if not uploaded_files:
+        st.warning(
+            "Please upload at least one file."
+        )
+
+    else:
+        with st.spinner(
+            "Reading documents, OCR-ing scanned pages, "
+            "building search index, and creating embeddings..."
+        ):
+            try:
+                records, unreadable = extract_documents(
+                    uploaded_files
+                )
+
+                if not records:
+                    st.session_state.vector_db = None
+                    st.session_state.chunks = []
+                    st.session_state.unreadable_files = unreadable
+
+                    st.error(
+                        "No readable content could be extracted "
+                        "from the uploaded files."
+                    )
+
+                else:
+                    chunks = build_chunks(
+                        records
+                    )
+
+                    index = build_vector_database(
+                        chunks
+                    )
+
+                    st.session_state.vector_db = index
+                    st.session_state.chunks = chunks
+                    st.session_state.unreadable_files = unreadable
+
+                    file_names = "|".join(
+                        sorted(
+                            file.name
+                            for file in uploaded_files
+                        )
+                    )
+
+                    signature = hashlib.sha256(
+                        file_names.encode("utf-8")
+                    ).hexdigest()
+
+                    st.session_state.processed_signature = signature
+
+                    st.success(
+                        f"Processed {len(uploaded_files)} file(s). "
+                        f"Created {len(records)} readable source records "
+                        f"and {len(chunks)} searchable chunks."
+                    )
+
+            except Exception as exc:
+                st.error(
+                    "Processing failed."
+                )
+                st.exception(exc)
+
+
+# ============================================================
+# UNREADABLE / BLURRY REPORT
+# ============================================================
 
 if st.session_state.unreadable_files:
-    st.warning('Some files or pages could not be read reliably.')
-    with st.expander('View unreadable pages/files'):
+    st.warning(
+        "Some pages/files could not be read reliably."
+    )
+
+    with st.expander(
+        "View unreadable pages/files"
+    ):
         for item in st.session_state.unreadable_files:
-            loc = item.get('location', item.get('source', 'Unknown file'))
-            method = item.get('method', 'unreadable')
-            if 'blurry' in method:
-                st.error(f"⚠️ {loc}: This page appears blurry. We can't reliably read its content.")
-            elif 'low_resolution' in method:
-                st.error(f"⚠️ {loc}: This page has very low resolution. We can't reliably read its content.")
+            location = item.get(
+                "location",
+                item.get(
+                    "source",
+                    "Unknown file",
+                ),
+            )
+
+            method = item.get(
+                "method",
+                "unreadable",
+            )
+
+            if "blurry" in method:
+                st.error(
+                    f"⚠️ {location}: "
+                    "This page appears blurry. "
+                    "We can't reliably read its content."
+                )
+
+            elif "low_resolution" in method:
+                st.error(
+                    f"⚠️ {location}: "
+                    "This page has very low resolution. "
+                    "We can't reliably read its content."
+                )
+
+            elif "low_contrast" in method:
+                st.error(
+                    f"⚠️ {location}: "
+                    "This page has very low contrast. "
+                    "We can't reliably read its content."
+                )
+
+            elif "ocr_failed" in method:
+                st.error(
+                    f"⚠️ {location}: "
+                    "OCR could not reliably read this page."
+                )
+
             else:
-                st.error(f"⚠️ {loc}: We couldn't reliably extract readable content.")
+                st.error(
+                    f"⚠️ {location}: "
+                    "We couldn't reliably extract readable content."
+                )
+
+
+# ============================================================
+# SEARCH / QUESTION AREA
+# ============================================================
 
 st.divider()
-question = st.text_area('💬 Ask a question', placeholder='Example: What is a loop?', height=100)
 
-if st.button('🔍 Ask', use_container_width=True):
+st.subheader("💬 Ask Your Document")
+
+question = st.text_area(
+    "Question",
+    placeholder=(
+        "Ask anything related to the uploaded documents. "
+        "For example: What is this? Where is it discussed? "
+        "What is its purpose? Which page contains it?"
+    ),
+    height=110,
+)
+
+
+if st.button(
+    "🔍 Ask",
+    use_container_width=True,
+):
     if st.session_state.vector_db is None:
-        st.warning('Please process your files first.')
+        st.warning(
+            "Please upload and process your files first."
+        )
+
     elif not question.strip():
-        st.warning('Please enter a question.')
+        st.warning(
+            "Please enter a question."
+        )
+
     else:
-        with st.spinner('Searching documents and generating answer...'):
-            answer = ask_documents(question, st.session_state.vector_db, st.session_state.chunks, response_language)
-        st.markdown(answer)
+        with st.spinner(
+            "Searching the complete document collection..."
+        ):
+            try:
+                answer = answer_question(
+                    question,
+                    st.session_state.vector_db,
+                    st.session_state.chunks,
+                    response_language,
+                )
+
+                st.markdown(answer)
+
+            except Exception as exc:
+                st.error(
+                    "An unexpected error occurred while answering."
+                )
+                st.exception(exc)
+
+
+# ============================================================
+# FOOTER
+# ============================================================
+
+st.divider()
+
+st.caption(
+    "Universal Document Q&A Assistant • "
+    "Hybrid lexical + semantic search • OCR • Source-aware answers"
+)
