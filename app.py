@@ -1496,9 +1496,12 @@ STRICT RULES:
     )
 
     # Stable/current-compatible fallbacks.
+    # Try the lighter model first because it is generally better suited
+    # to repeated RAG Q&A requests and then fall back to the standard model.
     models = [
-        "gemini-2.5-flash",
         "gemini-2.5-flash-lite",
+        "gemini-2.5-flash",
+        "gemini-3.5-flash-lite",
     ]
 
     last_error = ""
@@ -1542,7 +1545,7 @@ STRICT RULES:
                 )
 
                 if transient and attempt == 0:
-                    time.sleep(2)
+                    time.sleep(3)
                     continue
 
                 break
@@ -1770,9 +1773,6 @@ if "unreadable_files" not in st.session_state:
 if "processed_signature" not in st.session_state:
     st.session_state.processed_signature = None
 
-if "processed_file_count" not in st.session_state:
-    st.session_state.processed_file_count = 0
-
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
@@ -1800,35 +1800,19 @@ uploaded_files = st.file_uploader(
 
 
 # ============================================================
-# PROCESS FILES ONLY WHEN THE UPLOAD CHANGES
+# PROCESS BUTTON
 # ============================================================
 
-def get_upload_signature(uploaded_files, strategy):
-    """
-    Hash file CONTENT (not only filenames), so the app can tell whether
-    the actual uploaded files changed. The same files are therefore
-    processed only once per Streamlit session.
-    """
-    hasher = hashlib.sha256()
-    hasher.update(str(strategy).encode("utf-8"))
+if st.button(
+    "⚙️ Process Files",
+    use_container_width=True,
+):
+    if not uploaded_files:
+        st.warning(
+            "Please upload at least one file."
+        )
 
-    for uploaded in sorted(uploaded_files, key=lambda x: x.name.lower()):
-        data = uploaded.getvalue()
-        hasher.update(uploaded.name.encode("utf-8"))
-        hasher.update(str(len(data)).encode("utf-8"))
-        hasher.update(data)
-
-    return hasher.hexdigest()
-
-
-if uploaded_files:
-    current_signature = get_upload_signature(
-        uploaded_files,
-        chunk_strategy,
-    )
-
-    # Process automatically only on first upload or when files/settings change.
-    if current_signature != st.session_state.processed_signature:
+    else:
         with st.spinner(
             "Reading documents, OCR-ing scanned pages, "
             "building search index, and creating embeddings..."
@@ -1842,8 +1826,6 @@ if uploaded_files:
                     st.session_state.vector_db = None
                     st.session_state.chunks = []
                     st.session_state.unreadable_files = unreadable
-                    st.session_state.processed_signature = current_signature
-                    st.session_state.processed_file_count = len(uploaded_files)
 
                     st.error(
                         "No readable content could be extracted "
@@ -1863,38 +1845,41 @@ if uploaded_files:
                     st.session_state.vector_db = index
                     st.session_state.chunks = chunks
                     st.session_state.unreadable_files = unreadable
-                    st.session_state.processed_signature = current_signature
 
-                    # Start a fresh conversation when the document set changes.
-                    st.session_state.chat_history = []
+                    signature_parts = [
+                        f"STRATEGY:{chunk_strategy}"
+                    ]
+
+                    for file in sorted(
+                        uploaded_files,
+                        key=lambda item: item.name.lower(),
+                    ):
+                        file_bytes = file.getvalue()
+                        content_hash = hashlib.sha256(
+                            file_bytes
+                        ).hexdigest()
+
+                        signature_parts.append(
+                            f"{file.name}|{len(file_bytes)}|{content_hash}"
+                        )
+
+                    signature = hashlib.sha256(
+                        "\n".join(signature_parts).encode("utf-8")
+                    ).hexdigest()
+
+                    st.session_state.processed_signature = signature
 
                     st.success(
-                        f"Processed {len(uploaded_files)} file(s) once. "
+                        f"Processed {len(uploaded_files)} file(s). "
                         f"Created {len(records)} readable source records "
                         f"and {len(chunks)} searchable chunks."
                     )
 
             except Exception as exc:
-                st.error("Processing failed.")
+                st.error(
+                    "Processing failed."
+                )
                 st.exception(exc)
-
-    else:
-        st.caption(
-            "✓ These files are already processed. "
-            "No re-processing is needed for your questions."
-        )
-
-else:
-    # If the user removes all files, clear the old index.
-    if (
-        st.session_state.processed_signature is not None
-        and st.session_state.vector_db is not None
-    ):
-        st.session_state.vector_db = None
-        st.session_state.chunks = []
-        st.session_state.unreadable_files = []
-        st.session_state.processed_signature = None
-        st.session_state.chat_history = []
 
 
 # ============================================================
