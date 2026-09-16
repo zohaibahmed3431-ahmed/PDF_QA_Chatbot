@@ -1,0 +1,26 @@
+id,question,source_file,expected_location,expected_answer_keywords
+Q01,What is a signal?,Lecture-1-29082026-073742pm.pdf,Page 4,"signal, physical quantity, information"
+Q02,What is signal processing?,Lecture-1-29082026-073742pm.pdf,Page 6,"conversion, excitation, response"
+Q03,Give examples of signal processing systems.,Lecture-1-29082026-073742pm.pdf,Page 7,"speech recognition, audio CD, image compression"
+Q04,What is the human hearing frequency range mentioned for audio CDs?,Lecture-1-29082026-073742pm.pdf,Page 8,"20 Hz, 20 kHz"
+Q05,What does the sampling theorem say about the sampling rate?,Lecture-1-29082026-073742pm.pdf,Page 8,"more than twice, highest frequency"
+Q06,Why is a lowpass filter used before sampling?,Lecture-1-29082026-073742pm.pdf,Page 8,"pass frequencies, lowpass filter"
+Q07,What is a Digital Signal Processor (DSP)?,Lecture-1-29082026-073742pm.pdf,Page 9,"digital signals, processor"
+Q08,What happens to a signal after DSP processing before it can be sensed?,Lecture-1-29082026-073742pm.pdf,Page 9,converted back to analog
+Q09,What are two advantages of digital signal processing?,Lecture-1-29082026-073742pm.pdf,Page 10,"programmability, flexibility, repeatability"
+Q10,What is a waveform?,Lecture-1-29082026-073742pm.pdf,Page 12,"variation, signal value, independent variable"
+Q11,How is a signal defined in the lecture?,Lecture-1-29082026-073742pm.pdf,Page 12,"function, independent variable, information"
+Q12,What is a continuous or analog signal?,Lecture-1-29082026-073742pm.pdf,Page 14,"every instant, continuous time"
+Q13,What is a discrete-time signal?,Lecture-1-29082026-073742pm.pdf,Page 15,discrete values of time
+Q14,How can a discrete signal be obtained from an analog signal?,Lecture-1-29082026-073742pm.pdf,Page 15,"samples, discrete instants"
+Q15,What is sampling?,Lecture-1-29082026-073742pm.pdf,Page 16,"capturing, instant, amplitude values"
+Q16,What is a unit impulse used for?,Lecture-1-29082026-073742pm.pdf,Page 25,"science and engineering, idealization"
+Q17,What does an impulse of current deliver to a network?,Lecture-1-29082026-073742pm.pdf,Page 25,"unit charge, instantaneously"
+Q18,What does an impulse of force deliver to a mechanical system?,Lecture-1-29082026-073742pm.pdf,Page 25,instantaneous momentum
+Q19,What is quantization in analog-to-digital conversion?,Lecture-4-5-6-29082026-073940pm.pptx,Page 39,"quantization levels, analog signal"
+Q20,What is quantization error?,Lecture-4-5-6-29082026-073940pm.pptx,Page 40,"quantization error, error signal"
+Q21,What is SQNR used to measure?,Lecture-4-5-6-29082026-073940pm.pptx,Page 43,signal-to-quantization noise ratio
+Q22,Approximately how much does SQNR increase for every additional bit?,Lecture-4-5-6-29082026-073940pm.pptx,Page 43,approximately 6 dB
+Q23,What does the coding process in an A/D converter do?,Lecture-4-5-6-29082026-073940pm.pptx,Page 44,"binary number, quantization level"
+Q24,"For a 0–3 V signal with a 3-bit code, what is the quantization step size?",Lecture-4-5-6-29082026-073940pm.pptx,Page 45,0.375 V
+Q25,What is the purpose of the smoothing analog low-pass filter in D/A conversion?,Lecture-4-5-6-29082026-073940pm.pptx,Page 49,"remove high frequencies, smoothing"
