@@ -1770,6 +1770,9 @@ if "unreadable_files" not in st.session_state:
 if "processed_signature" not in st.session_state:
     st.session_state.processed_signature = None
 
+if "processed_file_count" not in st.session_state:
+    st.session_state.processed_file_count = 0
+
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
@@ -1797,19 +1800,35 @@ uploaded_files = st.file_uploader(
 
 
 # ============================================================
-# PROCESS BUTTON
+# PROCESS FILES ONLY WHEN THE UPLOAD CHANGES
 # ============================================================
 
-if st.button(
-    "⚙️ Process Files",
-    use_container_width=True,
-):
-    if not uploaded_files:
-        st.warning(
-            "Please upload at least one file."
-        )
+def get_upload_signature(uploaded_files, strategy):
+    """
+    Hash file CONTENT (not only filenames), so the app can tell whether
+    the actual uploaded files changed. The same files are therefore
+    processed only once per Streamlit session.
+    """
+    hasher = hashlib.sha256()
+    hasher.update(str(strategy).encode("utf-8"))
 
-    else:
+    for uploaded in sorted(uploaded_files, key=lambda x: x.name.lower()):
+        data = uploaded.getvalue()
+        hasher.update(uploaded.name.encode("utf-8"))
+        hasher.update(str(len(data)).encode("utf-8"))
+        hasher.update(data)
+
+    return hasher.hexdigest()
+
+
+if uploaded_files:
+    current_signature = get_upload_signature(
+        uploaded_files,
+        chunk_strategy,
+    )
+
+    # Process automatically only on first upload or when files/settings change.
+    if current_signature != st.session_state.processed_signature:
         with st.spinner(
             "Reading documents, OCR-ing scanned pages, "
             "building search index, and creating embeddings..."
@@ -1823,6 +1842,8 @@ if st.button(
                     st.session_state.vector_db = None
                     st.session_state.chunks = []
                     st.session_state.unreadable_files = unreadable
+                    st.session_state.processed_signature = current_signature
+                    st.session_state.processed_file_count = len(uploaded_files)
 
                     st.error(
                         "No readable content could be extracted "
@@ -1842,31 +1863,38 @@ if st.button(
                     st.session_state.vector_db = index
                     st.session_state.chunks = chunks
                     st.session_state.unreadable_files = unreadable
+                    st.session_state.processed_signature = current_signature
 
-                    file_names = "|".join(
-                        sorted(
-                            file.name
-                            for file in uploaded_files
-                        )
-                    )
-
-                    signature = hashlib.sha256(
-                        file_names.encode("utf-8")
-                    ).hexdigest()
-
-                    st.session_state.processed_signature = signature
+                    # Start a fresh conversation when the document set changes.
+                    st.session_state.chat_history = []
 
                     st.success(
-                        f"Processed {len(uploaded_files)} file(s). "
+                        f"Processed {len(uploaded_files)} file(s) once. "
                         f"Created {len(records)} readable source records "
                         f"and {len(chunks)} searchable chunks."
                     )
 
             except Exception as exc:
-                st.error(
-                    "Processing failed."
-                )
+                st.error("Processing failed.")
                 st.exception(exc)
+
+    else:
+        st.caption(
+            "✓ These files are already processed. "
+            "No re-processing is needed for your questions."
+        )
+
+else:
+    # If the user removes all files, clear the old index.
+    if (
+        st.session_state.processed_signature is not None
+        and st.session_state.vector_db is not None
+    ):
+        st.session_state.vector_db = None
+        st.session_state.chunks = []
+        st.session_state.unreadable_files = []
+        st.session_state.processed_signature = None
+        st.session_state.chat_history = []
 
 
 # ============================================================
