@@ -1,5 +1,6 @@
 import io
 import os
+import csv
 import re
 import time
 import hashlib
@@ -1779,6 +1780,12 @@ if "chat_history" not in st.session_state:
 if "chunk_strategy" not in st.session_state:
     st.session_state.chunk_strategy = "Balanced (850 / 140)"
 
+if "evaluation_results" not in st.session_state:
+    st.session_state.evaluation_results = None
+
+if "evaluation_metrics" not in st.session_state:
+    st.session_state.evaluation_metrics = None
+
 st.session_state.chunk_strategy = chunk_strategy
 
 
@@ -1803,6 +1810,26 @@ uploaded_files = st.file_uploader(
 # PROCESS BUTTON
 # ============================================================
 
+def current_upload_signature(uploaded_files, strategy):
+    if not uploaded_files:
+        return None
+
+    signature_parts = [f"STRATEGY:{strategy}"]
+    for file in sorted(uploaded_files, key=lambda item: item.name.lower()):
+        file_bytes = file.getvalue()
+        content_hash = hashlib.sha256(file_bytes).hexdigest()
+        signature_parts.append(f"{file.name}|{len(file_bytes)}|{content_hash}")
+
+    return hashlib.sha256(
+        "\n".join(signature_parts).encode("utf-8")
+    ).hexdigest()
+
+
+current_signature = current_upload_signature(
+    uploaded_files,
+    chunk_strategy,
+)
+
 if st.button(
     "⚙️ Process Files",
     use_container_width=True,
@@ -1810,6 +1837,16 @@ if st.button(
     if not uploaded_files:
         st.warning(
             "Please upload at least one file."
+        )
+
+    elif (
+        current_signature is not None
+        and current_signature == st.session_state.processed_signature
+        and st.session_state.vector_db is not None
+    ):
+        st.info(
+            "These files are already processed. No reprocessing is needed unless "
+            "a file is added, removed, changed, or the chunking strategy changes."
         )
 
     else:
@@ -1846,28 +1883,7 @@ if st.button(
                     st.session_state.chunks = chunks
                     st.session_state.unreadable_files = unreadable
 
-                    signature_parts = [
-                        f"STRATEGY:{chunk_strategy}"
-                    ]
-
-                    for file in sorted(
-                        uploaded_files,
-                        key=lambda item: item.name.lower(),
-                    ):
-                        file_bytes = file.getvalue()
-                        content_hash = hashlib.sha256(
-                            file_bytes
-                        ).hexdigest()
-
-                        signature_parts.append(
-                            f"{file.name}|{len(file_bytes)}|{content_hash}"
-                        )
-
-                    signature = hashlib.sha256(
-                        "\n".join(signature_parts).encode("utf-8")
-                    ).hexdigest()
-
-                    st.session_state.processed_signature = signature
+                    st.session_state.processed_signature = current_signature
 
                     st.success(
                         f"Processed {len(uploaded_files)} file(s). "
@@ -2027,6 +2043,248 @@ if st.button(
                 )
                 st.exception(exc)
 
+
+# ============================================================
+# RAG EVALUATION
+# ============================================================
+
+def load_evaluation_rows(file_bytes):
+    text = file_bytes.decode("utf-8-sig")
+    reader = csv.DictReader(io.StringIO(text))
+    required = {
+        "id",
+        "question",
+        "source_file",
+        "expected_location",
+        "expected_answer_keywords",
+    }
+    if not required.issubset(set(reader.fieldnames or [])):
+        missing = required.difference(set(reader.fieldnames or []))
+        raise ValueError(
+            "Evaluation CSV is missing columns: " + ", ".join(sorted(missing))
+        )
+
+    rows = []
+    for row in reader:
+        question = normalize_text(row.get("question", ""))
+        if not question:
+            continue
+        rows.append(row)
+    return rows
+
+
+def keyword_coverage(answer, keywords_text):
+    keywords = [
+        normalize_for_search(item)
+        for item in str(keywords_text or "").split("|")
+        if normalize_for_search(item)
+    ]
+    if not keywords:
+        return 0.0
+
+    answer_norm = normalize_for_search(answer)
+    matched = sum(1 for keyword in keywords if keyword in answer_norm)
+    return matched / len(keywords)
+
+
+def location_match(results, expected_file, expected_location):
+    expected_file_norm = normalize_for_search(expected_file)
+    expected_location_norm = normalize_for_search(expected_location)
+
+    for result in results:
+        source_norm = normalize_for_search(result.get("source", ""))
+        location_norm = normalize_for_search(result.get("location", ""))
+
+        file_ok = expected_file_norm in source_norm or source_norm in expected_file_norm
+        location_ok = expected_location_norm in location_norm
+
+        if file_ok and location_ok:
+            return True
+
+    return False
+
+
+def evaluate_rag(rows, index, chunks, language):
+    results_out = []
+    retrieval_hits = 0
+    total_keyword_coverage = 0.0
+
+    progress = st.progress(0)
+    status = st.empty()
+
+    for number, row in enumerate(rows, start=1):
+        question = normalize_text(row.get("question", ""))
+        status.write(f"Evaluating {number}/{len(rows)}: {question}")
+
+        retrieved = find_relevant_results(question, index, chunks)
+        retrieval_ok = location_match(
+            retrieved,
+            row.get("source_file", ""),
+            row.get("expected_location", ""),
+        )
+
+        history = "No previous conversation."
+        ai_answer, ai_error = generate_ai_answer(
+            question,
+            retrieved[:6],
+            language,
+            history,
+        )
+
+        if ai_answer:
+            answer = ai_answer
+            answer_status = "AI answer"
+        else:
+            answer = deterministic_answer(question, retrieved, language)
+            answer_status = "Fallback answer"
+
+        coverage = keyword_coverage(
+            answer,
+            row.get("expected_answer_keywords", ""),
+        )
+
+        if retrieval_ok:
+            retrieval_hits += 1
+        total_keyword_coverage += coverage
+
+        results_out.append({
+            "id": row.get("id", str(number)),
+            "question": question,
+            "expected_source": row.get("source_file", ""),
+            "expected_location": row.get("expected_location", ""),
+            "retrieval_hit": "Yes" if retrieval_ok else "No",
+            "answer_keyword_coverage": round(coverage, 3),
+            "answer_status": answer_status,
+            "answer": answer,
+            "retrieved_sources": " | ".join(
+                result.get("location", "") for result in retrieved[:8]
+            ),
+        })
+
+        progress.progress(number / len(rows))
+
+    status.empty()
+    progress.empty()
+
+    count = len(rows)
+    retrieval_rate = retrieval_hits / count if count else 0.0
+    answer_coverage = total_keyword_coverage / count if count else 0.0
+    overall = (retrieval_rate + answer_coverage) / 2
+
+    return results_out, retrieval_rate, answer_coverage, overall
+
+
+st.divider()
+st.subheader("🧪 RAG Evaluation")
+st.caption(
+    "Run the 25-question evaluation dataset to measure retrieval accuracy "
+    "and document-grounded answer keyword coverage."
+)
+
+repo_eval_path = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "rag_evaluation_25_questions.csv",
+)
+
+eval_rows = None
+if os.path.exists(repo_eval_path):
+    try:
+        with open(repo_eval_path, "rb") as eval_file:
+            eval_rows = load_evaluation_rows(eval_file.read())
+        st.success(f"Evaluation dataset loaded: {len(eval_rows)} questions.")
+    except Exception as exc:
+        st.error("Could not read the repository evaluation CSV.")
+        st.exception(exc)
+else:
+    evaluation_upload = st.file_uploader(
+        "Upload evaluation CSV",
+        type=["csv"],
+        key="evaluation_csv",
+    )
+    if evaluation_upload is not None:
+        try:
+            eval_rows = load_evaluation_rows(evaluation_upload.getvalue())
+            st.success(f"Evaluation dataset loaded: {len(eval_rows)} questions.")
+        except Exception as exc:
+            st.error("Invalid evaluation CSV.")
+            st.exception(exc)
+
+if eval_rows and st.session_state.vector_db is not None:
+    if st.button("▶️ Run RAG Evaluation", use_container_width=True):
+        with st.spinner("Running evaluation. This may take a few minutes..."):
+            try:
+                evaluation_results, retrieval_rate, answer_coverage, overall = evaluate_rag(
+                    eval_rows,
+                    st.session_state.vector_db,
+                    st.session_state.chunks,
+                    response_language,
+                )
+
+                st.session_state.evaluation_results = evaluation_results
+                st.session_state.evaluation_metrics = {
+                    "retrieval_rate": retrieval_rate,
+                    "answer_coverage": answer_coverage,
+                    "overall": overall,
+                }
+            except Exception as exc:
+                st.error("Evaluation failed.")
+                st.exception(exc)
+
+if st.session_state.get("evaluation_results"):
+    metrics = st.session_state.evaluation_metrics
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Retrieval Hit Rate", f"{metrics['retrieval_rate'] * 100:.1f}%")
+    col2.metric("Answer Keyword Coverage", f"{metrics['answer_coverage'] * 100:.1f}%")
+    col3.metric("Combined Evaluation Score", f"{metrics['overall'] * 100:.1f}%")
+
+    st.markdown("### Evaluation Results")
+    st.dataframe(
+        [
+            {
+                "ID": item["id"],
+                "Question": item["question"],
+                "Retrieval Hit": item["retrieval_hit"],
+                "Keyword Coverage": item["answer_keyword_coverage"],
+                "Status": item["answer_status"],
+            }
+            for item in st.session_state.evaluation_results
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    output = io.StringIO()
+    fieldnames = list(st.session_state.evaluation_results[0].keys())
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(st.session_state.evaluation_results)
+
+    report_text = (
+        "RAG Evaluation Report\n"
+        "====================\n"
+        f"Questions: {len(st.session_state.evaluation_results)}\n"
+        f"Chunking strategy: {st.session_state.chunk_strategy}\n"
+        f"Retrieval Hit Rate: {metrics['retrieval_rate'] * 100:.1f}%\n"
+        f"Answer Keyword Coverage: {metrics['answer_coverage'] * 100:.1f}%\n"
+        f"Combined Evaluation Score: {metrics['overall'] * 100:.1f}%\n"
+    )
+
+    st.download_button(
+        "⬇️ Download Evaluation CSV",
+        data=output.getvalue().encode("utf-8"),
+        file_name="rag_evaluation_results.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    st.download_button(
+        "⬇️ Download Evaluation Report",
+        data=report_text.encode("utf-8"),
+        file_name="rag_evaluation_report.txt",
+        mime="text/plain",
+        use_container_width=True,
+    )
 
 # ============================================================
 # FOOTER
