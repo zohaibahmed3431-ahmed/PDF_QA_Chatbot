@@ -273,39 +273,37 @@ def image_quality(image):
 def preprocess_for_ocr(image):
     image = image.convert("RGB")
 
-    # Upscale smaller images for OCR.
+    # Upscale small images so small labels and dimensions are easier to read.
     w, h = image.size
-    if max(w, h) < 1800:
-        scale = 1800 / max(w, h)
-        image = image.resize(
-            (int(w * scale), int(h * scale))
-        )
+    if max(w, h) < 2400:
+        scale = 2400 / max(w, h)
+        image = image.resize((int(w * scale), int(h * scale)))
 
     gray = ImageOps.grayscale(image)
     gray = ImageOps.autocontrast(gray)
-
     return gray
 
 
 def perform_ocr(image):
     prepared = preprocess_for_ocr(image)
 
-    languages = ["eng+urd", "eng"]
+    # Images can have scattered labels, diagrams, headings and tables.
+    # Try several Tesseract layouts instead of assuming one paragraph layout.
+    best = ""
+    for language in ("eng+urd", "eng"):
+        for psm in (11, 6, 12):
+            try:
+                text = pytesseract.image_to_string(
+                    prepared,
+                    lang=language,
+                    config=f"--psm {psm}",
+                ).strip()
+                if len(text) > len(best):
+                    best = text
+            except Exception:
+                continue
 
-    for language in languages:
-        try:
-            text = pytesseract.image_to_string(
-                prepared,
-                lang=language,
-                config="--psm 6",
-            ).strip()
-
-            if len(text) >= 5:
-                return normalize_text(text)
-        except Exception:
-            pass
-
-    return ""
+    return normalize_text(best)
 
 
 # ============================================================
@@ -626,24 +624,14 @@ with one item per line where practical.
 
 
 def process_image(data, name):
-    image = Image.open(
-        io.BytesIO(data)
-    ).convert("RGB")
+    """Process the whole image as one logical document.
 
-    readable, reason = image_quality(image)
+    Never discard an image merely because the blur/contrast heuristic is
+    uncertain. OCR and Gemini Vision are both attempted so posters, flyers,
+    diagrams and property sheets with scattered labels remain searchable.
+    """
+    image = Image.open(io.BytesIO(data)).convert("RGB")
 
-    if not readable:
-        return [{
-            "text": "",
-            "source": name,
-            "page": None,
-            "location": name,
-            "method": f"unreadable:{reason}",
-            "record_id": f"{name}:image",
-        }]
-
-    # OCR catches exact printed text; Gemini vision supplements OCR for
-    # small labels, dimensions, icons and visually arranged information.
     ocr_text = perform_ocr(image)
     vision_text = vision_extract_image_text(data, name)
 
@@ -670,7 +658,7 @@ def process_image(data, name):
         "source": name,
         "page": None,
         "location": name,
-        "method": "unreadable:ocr_failed",
+        "method": "unreadable:ocr_and_vision_failed",
         "record_id": f"{name}:image",
     }]
 
@@ -1677,8 +1665,8 @@ STRICT RULES:
 15. For image-based documents, inspect and use ALL readable information belonging to the requested item, including labels, dimensions, rooms, facilities, amenities, features, addresses, contact details, headings, captions, logos/names, prices, dates, and other relevant text. Do not omit a relevant field merely because it appears in another part of the same image.
 16. For a single image containing many labeled sections, treat the entire image as one logical source and combine its relevant OCR text before answering.
 17. Organize comprehensive answers with clear headings and bullet points when there are multiple details.
-16. For a normal specific question, answer only what was asked; do not dump unrelated document content.
-17. Keep the answer clear and useful.
+18. For a normal specific question, answer only what was asked; do not dump unrelated document content.
+19. Keep the answer clear and useful.
 """
 
     client = genai.Client(
