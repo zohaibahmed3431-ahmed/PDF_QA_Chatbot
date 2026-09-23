@@ -21,6 +21,7 @@ from openpyxl import load_workbook
 from sentence_transformers import SentenceTransformer
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from google import genai
+from google.genai import types
 
 
 # ============================================================
@@ -273,37 +274,39 @@ def image_quality(image):
 def preprocess_for_ocr(image):
     image = image.convert("RGB")
 
-    # Upscale small images so small labels and dimensions are easier to read.
+    # Upscale smaller images for OCR.
     w, h = image.size
-    if max(w, h) < 2400:
-        scale = 2400 / max(w, h)
-        image = image.resize((int(w * scale), int(h * scale)))
+    if max(w, h) < 1800:
+        scale = 1800 / max(w, h)
+        image = image.resize(
+            (int(w * scale), int(h * scale))
+        )
 
     gray = ImageOps.grayscale(image)
     gray = ImageOps.autocontrast(gray)
+
     return gray
 
 
 def perform_ocr(image):
     prepared = preprocess_for_ocr(image)
 
-    # Images can have scattered labels, diagrams, headings and tables.
-    # Try several Tesseract layouts instead of assuming one paragraph layout.
-    best = ""
-    for language in ("eng+urd", "eng"):
-        for psm in (11, 6, 12):
-            try:
-                text = pytesseract.image_to_string(
-                    prepared,
-                    lang=language,
-                    config=f"--psm {psm}",
-                ).strip()
-                if len(text) > len(best):
-                    best = text
-            except Exception:
-                continue
+    languages = ["eng+urd", "eng"]
 
-    return normalize_text(best)
+    for language in languages:
+        try:
+            text = pytesseract.image_to_string(
+                prepared,
+                lang=language,
+                config="--psm 6",
+            ).strip()
+
+            if len(text) >= 5:
+                return normalize_text(text)
+        except Exception:
+            pass
+
+    return ""
 
 
 # ============================================================
@@ -566,55 +569,56 @@ def process_xlsx(data, name):
     return records
 
 
+def generate_image_document_description(data, name):
+    """Use Gemini Vision to turn a standalone image into searchable document text.
 
-def vision_extract_image_text(data, name):
-    """Use Gemini vision as a supplemental transcription for image files.
-    OCR remains the fallback. The model is instructed to transcribe visible
-    text/labels only and not invent missing values.
+    OCR alone is not enough for posters, floor plans, advertisements,
+    diagrams, and other images where important information is visual.
     """
-    key = get_gemini_api_key()
+    key = get_api_key()
     if not key:
         return ""
 
+    ext = name.lower().rsplit(".", 1)[-1] if "." in name else "png"
+    mime_map = {
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "png": "image/png",
+        "webp": "image/webp",
+    }
+    mime_type = mime_map.get(ext, "image/png")
+
+    prompt = """
+Analyze this uploaded image as a document that a user may ask ANY question about.
+Create a comprehensive, factual, searchable description using ONLY what is visible in the image.
+
+IMPORTANT:
+- Transcribe ALL readable text, not just the title.
+- Capture every labeled room, object, feature, amenity, facility, dimension, number, address,
+  contact number, brand/company name, heading, caption, and other visible detail.
+- For floor plans, include every room and its visible dimensions and every labeled facility.
+- For posters/ads, include every listed feature, service, price/number, location and contact detail.
+- For diagrams/charts, describe the visible labels and relationships.
+- If an icon has a readable label, include that label.
+- Do not summarize away small details.
+- Do not guess text that is not readable.
+- Organize the result with clear headings/bullets so retrieval can find individual details later.
+"""
+
     try:
         client = genai.Client(api_key=key)
-        mime_type = (
-            "image/jpeg" if name.lower().endswith((".jpg", ".jpeg"))
-            else "image/webp" if name.lower().endswith(".webp")
-            else "image/png"
-        )
-        image_part = types.Part.from_bytes(
-            data=data,
-            mime_type=mime_type,
-        )
-        prompt = """
-You are an image-document transcription assistant.
-
-Transcribe ALL readable information visible in this image. This is for a
-document Q&A system, so completeness matters.
-
-Include:
-- title/headings/names
-- every room/area and its visible dimensions
-- every amenity/facility/icon label
-- addresses/locations
-- phone/contact numbers
-- prices, dates, codes, identifiers
-- captions, notes, labels and other visible text
-
-Preserve values as they appear. If text is unclear, mark it as [unclear]
-instead of guessing. Do not add outside knowledge. Return plain text only,
-with one item per line where practical.
-"""
-        for model in ("gemini-2.5-flash-lite", "gemini-2.5-flash"):
+        for model in ("gemini-2.5-flash", "gemini-2.5-flash-lite"):
             try:
                 response = client.models.generate_content(
                     model=model,
-                    contents=[prompt, image_part],
+                    contents=[
+                        prompt,
+                        types.Part.from_bytes(data=data, mime_type=mime_type),
+                    ],
                 )
-                out = getattr(response, "text", None)
-                if out and out.strip():
-                    return out.strip()
+                text = getattr(response, "text", None)
+                if text and text.strip():
+                    return normalize_text(text)
             except Exception:
                 continue
     except Exception:
@@ -624,24 +628,20 @@ with one item per line where practical.
 
 
 def process_image(data, name):
-    """Process the whole image as one logical document.
-
-    Never discard an image merely because the blur/contrast heuristic is
-    uncertain. OCR and Gemini Vision are both attempted so posters, flyers,
-    diagrams and property sheets with scattered labels remain searchable.
-    """
     image = Image.open(io.BytesIO(data)).convert("RGB")
 
+    # Never reject a standalone image just because OCR quality heuristics are weak.
+    # Vision can understand layouts and visual labels that OCR misses.
+    vision_text = generate_image_document_description(data, name)
     ocr_text = perform_ocr(image)
-    vision_text = vision_extract_image_text(data, name)
 
     combined_parts = []
-    if ocr_text:
-        combined_parts.append("OCR transcription:\n" + ocr_text)
     if vision_text:
-        combined_parts.append("Vision transcription:\n" + vision_text)
+        combined_parts.append("VISUAL DOCUMENT ANALYSIS:\n" + vision_text)
+    if ocr_text:
+        combined_parts.append("RAW OCR TEXT:\n" + ocr_text)
 
-    combined = "\n\n".join(combined_parts).strip()
+    combined = normalize_text("\n\n".join(combined_parts))
 
     if combined:
         return [{
@@ -649,7 +649,7 @@ def process_image(data, name):
             "source": name,
             "page": None,
             "location": name,
-            "method": "ocr+vision",
+            "method": "vision+ocr" if vision_text and ocr_text else ("vision" if vision_text else "ocr"),
             "record_id": f"{name}:image",
         }]
 
@@ -658,7 +658,7 @@ def process_image(data, name):
         "source": name,
         "page": None,
         "location": name,
-        "method": "unreadable:ocr_and_vision_failed",
+        "method": "unreadable:vision_and_ocr_failed",
         "record_id": f"{name}:image",
     }]
 
@@ -783,12 +783,12 @@ def build_chunks(records, strategy="Balanced (850 / 140)"):
         # use ALL visible fields from the same image (rooms, dimensions,
         # facilities, address, contacts, headings, etc.).
         is_image_ocr = (
-            str(record.get("method", "")).startswith(("ocr", "vision"))
+            str(record.get("method", "")).startswith("ocr")
             and str(record.get("source", "")).lower().rsplit(".", 1)[-1]
             in {"jpg", "jpeg", "png", "webp"}
         )
 
-        if is_image_ocr:
+        if is_image_ocr and len(record_text) <= 5000:
             pieces = [record_text]
         else:
             pieces = splitter.split_text(record_text)
@@ -1293,7 +1293,7 @@ def expand_related_context(question, selected, chunks):
     for item in chunks:
         if (
             item.get("source") in matched_sources
-            and str(item.get("method", "")).startswith(("ocr", "vision"))
+            and str(item.get("method", "")).startswith("ocr")
         ):
             add(item)
 
@@ -1665,8 +1665,8 @@ STRICT RULES:
 15. For image-based documents, inspect and use ALL readable information belonging to the requested item, including labels, dimensions, rooms, facilities, amenities, features, addresses, contact details, headings, captions, logos/names, prices, dates, and other relevant text. Do not omit a relevant field merely because it appears in another part of the same image.
 16. For a single image containing many labeled sections, treat the entire image as one logical source and combine its relevant OCR text before answering.
 17. Organize comprehensive answers with clear headings and bullet points when there are multiple details.
-18. For a normal specific question, answer only what was asked; do not dump unrelated document content.
-19. Keep the answer clear and useful.
+16. For a normal specific question, answer only what was asked; do not dump unrelated document content.
+17. Keep the answer clear and useful.
 """
 
     client = genai.Client(
@@ -2163,8 +2163,7 @@ with st.form("document_question_form", clear_on_submit=False):
         "Question",
         placeholder=(
             "Ask anything about the uploaded files. "
-            "Any topic, any file type, any question is supported. "
-            "Press Enter to search."
+            "Any topic, any file type, any question is supported. Press Enter to search."
         ),
     )
     ask_submitted = st.form_submit_button(
