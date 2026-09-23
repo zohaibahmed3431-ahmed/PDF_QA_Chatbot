@@ -568,6 +568,63 @@ def process_xlsx(data, name):
     return records
 
 
+
+def vision_extract_image_text(data, name):
+    """Use Gemini vision as a supplemental transcription for image files.
+    OCR remains the fallback. The model is instructed to transcribe visible
+    text/labels only and not invent missing values.
+    """
+    key = get_gemini_api_key()
+    if not key:
+        return ""
+
+    try:
+        client = genai.Client(api_key=key)
+        mime_type = (
+            "image/jpeg" if name.lower().endswith((".jpg", ".jpeg"))
+            else "image/webp" if name.lower().endswith(".webp")
+            else "image/png"
+        )
+        image_part = types.Part.from_bytes(
+            data=data,
+            mime_type=mime_type,
+        )
+        prompt = """
+You are an image-document transcription assistant.
+
+Transcribe ALL readable information visible in this image. This is for a
+document Q&A system, so completeness matters.
+
+Include:
+- title/headings/names
+- every room/area and its visible dimensions
+- every amenity/facility/icon label
+- addresses/locations
+- phone/contact numbers
+- prices, dates, codes, identifiers
+- captions, notes, labels and other visible text
+
+Preserve values as they appear. If text is unclear, mark it as [unclear]
+instead of guessing. Do not add outside knowledge. Return plain text only,
+with one item per line where practical.
+"""
+        for model in ("gemini-2.5-flash-lite", "gemini-2.5-flash"):
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=[prompt, image_part],
+                )
+                out = getattr(response, "text", None)
+                if out and out.strip():
+                    return out.strip()
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return ""
+
+
 def process_image(data, name):
     image = Image.open(
         io.BytesIO(data)
@@ -585,15 +642,26 @@ def process_image(data, name):
             "record_id": f"{name}:image",
         }]
 
-    text = perform_ocr(image)
+    # OCR catches exact printed text; Gemini vision supplements OCR for
+    # small labels, dimensions, icons and visually arranged information.
+    ocr_text = perform_ocr(image)
+    vision_text = vision_extract_image_text(data, name)
 
-    if text:
+    combined_parts = []
+    if ocr_text:
+        combined_parts.append("OCR transcription:\n" + ocr_text)
+    if vision_text:
+        combined_parts.append("Vision transcription:\n" + vision_text)
+
+    combined = "\n\n".join(combined_parts).strip()
+
+    if combined:
         return [{
-            "text": text,
+            "text": combined,
             "source": name,
             "page": None,
             "location": name,
-            "method": "ocr",
+            "method": "ocr+vision",
             "record_id": f"{name}:image",
         }]
 
@@ -727,12 +795,12 @@ def build_chunks(records, strategy="Balanced (850 / 140)"):
         # use ALL visible fields from the same image (rooms, dimensions,
         # facilities, address, contacts, headings, etc.).
         is_image_ocr = (
-            str(record.get("method", "")).startswith("ocr")
+            str(record.get("method", "")).startswith(("ocr", "vision"))
             and str(record.get("source", "")).lower().rsplit(".", 1)[-1]
             in {"jpg", "jpeg", "png", "webp"}
         )
 
-        if is_image_ocr and len(record_text) <= 5000:
+        if is_image_ocr:
             pieces = [record_text]
         else:
             pieces = splitter.split_text(record_text)
@@ -1237,7 +1305,7 @@ def expand_related_context(question, selected, chunks):
     for item in chunks:
         if (
             item.get("source") in matched_sources
-            and str(item.get("method", "")).startswith("ocr")
+            and str(item.get("method", "")).startswith(("ocr", "vision"))
         ):
             add(item)
 
@@ -2103,13 +2171,13 @@ if st.button("🧹 Clear Conversation"):
     st.rerun()
 
 with st.form("document_question_form", clear_on_submit=False):
-    question = st.text_area(
+    question = st.text_input(
         "Question",
         placeholder=(
             "Ask anything about the uploaded files. "
-            "Any topic, any file type, any question is supported."
+            "Any topic, any file type, any question is supported. "
+            "Press Enter to search."
         ),
-        height=110,
     )
     ask_submitted = st.form_submit_button(
         "🔍 Ask",
