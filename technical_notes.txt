@@ -1,7 +1,0 @@
-RAG Technical Notes
-
-Retrieval Pipeline
-A retrieval-augmented generation system can split documents into chunks, create embeddings, store vectors in a database, retrieve relevant chunks, and provide those chunks to a language model as grounded context.
-
-Vector Search
-FAISS can store dense vectors and perform similarity search. A chunk overlap of 100 tokens can help preserve context across chunk boundaries. Hybrid retrieval can combine lexical matching with semantic similarity.
