@@ -607,7 +607,7 @@ Preserve values as they appear. If text is unclear, mark it as [unclear]
 instead of guessing. Do not add outside knowledge. Return plain text only,
 with one item per line where practical.
 """
-        for model in ("gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3.8-flash"):
+        for model in ("gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"):
             try:
                 response = client.models.generate_content(
                     model=model,
@@ -1709,12 +1709,13 @@ STRICT RULES:
     except Exception as exc:
         return None, f"Gemini client initialization failed: {exc}"
 
-    # Current stable models first; older stable models remain as fallbacks.
+    # Current stable models, ordered from newest to lighter fallbacks.
+    # Avoid retired/limited 2.5 models for new-user API keys.
     models = [
-        "gemini-3.5-flash",
-        "gemini-3.5-flash-lite",
         "gemini-3.8-flash",
-        "gemini-2.5-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash-lite",
     ]
 
     errors = []
@@ -1736,28 +1737,25 @@ STRICT RULES:
                     return answer_text.strip(), None
 
                 errors.append(f"{model}: returned an empty response")
+                break
 
             except Exception as exc:
-                errors.append(f"{model}: {exc}")
-
                 error_text = str(exc)
+                errors.append(f"{model} (attempt {attempt + 1}): {error_text}")
+
                 transient = any(
                     marker in error_text.upper()
                     for marker in (
-                        "429",
-                        "500",
-                        "502",
-                        "503",
-                        "504",
-                        "UNAVAILABLE",
-                        "RESOURCE_EXHAUSTED",
-                        "DEADLINE_EXCEEDED",
-                        "INTERNAL",
+                        "429", "500", "502", "503", "504",
+                        "UNAVAILABLE", "RESOURCE_EXHAUSTED",
+                        "DEADLINE_EXCEEDED", "INTERNAL",
                     )
                 )
 
                 if transient and attempt == 0:
-                    time.sleep(2)
+                    # Give a temporary capacity/rate-limit error a chance
+                    # to recover before moving to the next model.
+                    time.sleep(3)
                     continue
 
                 break
@@ -2530,5 +2528,4 @@ st.caption(
     "Production-Style RAG AI Assistant • "
     "Hybrid lexical + semantic retrieval • Configurable chunking • OCR • Conversation history • Prompt-injection protection"
 )
-
 
