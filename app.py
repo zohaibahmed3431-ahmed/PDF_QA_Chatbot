@@ -607,7 +607,7 @@ Preserve values as they appear. If text is unclear, mark it as [unclear]
 instead of guessing. Do not add outside knowledge. Return plain text only,
 with one item per line where practical.
 """
-        for model in ("gemini-2.5-flash-lite", "gemini-2.5-flash"):
+        for model in ("gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3.8-flash"):
             try:
                 response = client.models.generate_content(
                     model=model,
@@ -1711,13 +1711,13 @@ STRICT RULES:
 
     # Current stable models first; older stable models remain as fallbacks.
     models = [
-        "gemini-3.8-flash",
+        "gemini-3.5-flash",
         "gemini-3.5-flash-lite",
+        "gemini-3.8-flash",
         "gemini-2.5-flash",
-        "gemini-2.5-flash-lite",
     ]
 
-    last_error = ""
+    errors = []
 
     contents = [prompt]
     contents.extend(image_parts)
@@ -1735,10 +1735,10 @@ STRICT RULES:
                 if answer_text and answer_text.strip():
                     return answer_text.strip(), None
 
-                last_error = f"{model} returned an empty response."
+                errors.append(f"{model}: returned an empty response")
 
             except Exception as exc:
-                last_error = f"{model}: {exc}"
+                errors.append(f"{model}: {exc}")
 
                 transient = any(
                     marker in last_error.upper()
@@ -1762,8 +1762,8 @@ STRICT RULES:
                 break
 
     return None, (
-        "Gemini request failed after all configured models. "
-        f"Last error: {last_error}"
+        "Gemini request failed for every configured model. "
+        "Errors: " + " | ".join(errors[-8:])
     )
 
 
