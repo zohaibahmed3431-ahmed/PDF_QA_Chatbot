@@ -2444,14 +2444,49 @@ if show_evaluation:
     st.divider()
     st.subheader("🧪 Project 4 RAG Evaluation")
     st.caption(
-        "Optional evaluation mode. Normal document Q&A is universal and is not "
-        "limited to these test questions."
+        "The Q&A system is universal. The bundled 25-question dataset is only "
+        "a neutral evaluation demo and is not used to restrict normal document Q&A."
     )
 
-    repo_eval_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "rag_evaluation_25_questions.csv",
-    )
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    repo_eval_path = os.path.join(repo_root, "rag_evaluation_25_questions.csv")
+    demo_dir = os.path.join(repo_root, "evaluation_demo")
+
+    # The neutral evaluation corpus is loaded only when the user explicitly
+    # asks for the Project 4 demo. It never becomes part of normal Q&A.
+    if os.path.isdir(demo_dir) and st.button(
+        "📦 Load Neutral Evaluation Demo",
+        use_container_width=True,
+        help="Loads only the bundled evaluation corpus so the 25-question demo can be reproduced.",
+    ):
+        class DemoUpload:
+            def __init__(self, name, data):
+                self.name = name
+                self._data = data
+
+            def getvalue(self):
+                return self._data
+
+        demo_files = []
+        for filename in sorted(os.listdir(demo_dir)):
+            path = os.path.join(demo_dir, filename)
+            if os.path.isfile(path) and filename.lower().endswith((".txt", ".pdf", ".docx", ".pptx", ".xlsx", ".csv", ".png", ".jpg", ".jpeg", ".webp")):
+                with open(path, "rb") as demo_file:
+                    demo_files.append(DemoUpload(filename, demo_file.read()))
+
+        try:
+            with st.spinner("Loading neutral evaluation documents and building the evaluation index..."):
+                demo_records, demo_unreadable = extract_documents(demo_files)
+                demo_chunks = build_chunks(demo_records, chunk_strategy)
+                demo_index = build_vector_database(demo_chunks)
+                st.session_state.vector_db = demo_index
+                st.session_state.chunks = demo_chunks
+                st.session_state.unreadable_files = demo_unreadable
+                st.session_state.processed_signature = None
+            st.success(f"Loaded {len(demo_files)} evaluation documents and {len(demo_chunks)} searchable chunks.")
+        except Exception as exc:
+            st.error("Could not load the neutral evaluation corpus.")
+            st.exception(exc)
 
     eval_rows = None
     if os.path.exists(repo_eval_path):
@@ -2462,19 +2497,19 @@ if show_evaluation:
         except Exception as exc:
             st.error("Could not read the repository evaluation CSV.")
             st.exception(exc)
-    else:
-        evaluation_upload = st.file_uploader(
-            "Upload evaluation CSV",
-            type=["csv"],
-            key="evaluation_csv",
-        )
-        if evaluation_upload is not None:
-            try:
-                eval_rows = load_evaluation_rows(evaluation_upload.getvalue())
-                st.success(f"Evaluation dataset loaded: {len(eval_rows)} questions.")
-            except Exception as exc:
-                st.error("Invalid evaluation CSV.")
-                st.exception(exc)
+
+    evaluation_upload = st.file_uploader(
+        "Or upload your own 20–30 question evaluation CSV",
+        type=["csv"],
+        key="evaluation_csv",
+    )
+    if evaluation_upload is not None:
+        try:
+            eval_rows = load_evaluation_rows(evaluation_upload.getvalue())
+            st.success(f"Custom evaluation dataset loaded: {len(eval_rows)} questions.")
+        except Exception as exc:
+            st.error("Invalid evaluation CSV.")
+            st.exception(exc)
 
     if eval_rows and st.session_state.vector_db is not None:
         if st.button("▶️ Run RAG Evaluation", use_container_width=True):
