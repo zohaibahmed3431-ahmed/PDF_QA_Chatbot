@@ -1775,50 +1775,87 @@ def deterministic_answer(
     results,
     language,
 ):
+    """Grounded non-LLM fallback.
+
+    This fallback is intentionally extractive: it never invents facts. It
+    combines the strongest retrieved passages so the application remains
+    usable when the external LLM is temporarily unavailable.
     """
-    This is deliberately extractive.
-
-    If Gemini is unavailable, the app still:
-    - confirms relevant content exists,
-    - gives the source/page,
-    - shows the actual matched passage.
-
-    It does NOT invent an explanation.
-    """
-
     if not results:
-        return not_found_message(
-            language
-        )
+        return not_found_message(language)
 
-    top = results[0]
-    excerpt = excerpt_for_result(
-        top,
-        question,
-    )
+    # Keep the best unique passages. For broad/entity questions we want more
+    # than one chunk because details such as title, dimensions, address and
+    # contacts may be stored in different OCR chunks.
+    passages = []
+    seen = set()
+    for result in results[:32]:
+        text_value = str(result.get("text", "") or "").strip()
+        if not text_value:
+            continue
+        key = normalize_for_search(text_value)
+        if key and key not in seen:
+            seen.add(key)
+            passages.append((result, text_value))
+
+    if not passages:
+        return not_found_message(language)
+
+    # Prefer lines that overlap with the question, while preserving headings
+    # and structured values (dimensions, phone numbers, addresses, etc.).
+    q_terms = [
+        term for term in re.findall(r"[A-Za-z0-9]+", question.lower())
+        if len(term) >= 2
+    ]
+
+    selected = []
+    selected_keys = set()
+    for result, text_value in passages:
+        lines = [
+            re.sub(r"\\s+", " ", line).strip(" -|•")
+            for line in text_value.splitlines()
+            if line.strip()
+        ]
+        for line in lines:
+            norm = normalize_for_search(line)
+            if not norm or norm in selected_keys:
+                continue
+
+            score = sum(1 for term in q_terms if term in norm)
+            structured = bool(re.search(
+                r"(sq\\.?\\s*ft|\\d+['’]-\\d+|\\d{3,}[- ]?\\d{3,}|@|address|contact|bedroom|bathroom|kitchen|lounge|terrace|room|type)",
+                line,
+                re.I,
+            ))
+
+            if score > 0 or structured:
+                selected.append((score, line))
+                selected_keys.add(norm)
+
+    # If line filtering found too little, preserve the strongest full passage.
+    if len(selected) < 3:
+        for _, text_value in passages[:4]:
+            for line in text_value.splitlines():
+                clean = re.sub(r"\\s+", " ", line).strip(" -|•")
+                norm = normalize_for_search(clean)
+                if clean and norm and norm not in selected_keys:
+                    selected.append((0, clean))
+                    selected_keys.add(norm)
+
+    selected.sort(key=lambda item: item[0], reverse=True)
+    lines = [line for _, line in selected[:40]]
 
     if language == "Urdu":
-        answer = (
-            "فائل میں اس سوال سے متعلق مواد ملا ہے۔ "
-            "متعلقہ جگہ نیچے دی گئی ہے۔\n\n"
-            f"متعلقہ مواد:\n{excerpt}"
-        )
-
+        intro = "Gemini AI is waqt temporarily unavailable hai, lekin RAG ne document se relevant information directly extract ki hai:"
+        heading = "Document se relevant details:"
     elif language == "Roman Urdu":
-        answer = (
-            "File mein is sawal se related content mila hai. "
-            "Relevant location neeche di gayi hai.\n\n"
-            f"Relevant content:\n{excerpt}"
-        )
-
+        intro = "Gemini AI is waqt temporarily unavailable hai, lekin RAG ne document se relevant information directly extract ki hai:"
+        heading = "Document se relevant details:"
     else:
-        answer = (
-            "Relevant content was found in the uploaded file. "
-            "The matched passage is shown below.\n\n"
-            f"Relevant content:\n{excerpt}"
-        )
+        intro = "Gemini is temporarily unavailable, so this grounded RAG fallback is showing the relevant information extracted directly from the document:"
+        heading = "Relevant document details:"
 
-    return answer
+    return intro + "\n\n**" + heading + "**\n" + "\n".join(f"- {line}" for line in lines)
 
 
 # ============================================================
@@ -1889,7 +1926,7 @@ def answer_question(
                 answer += (
                     "\n\nGemini explanation اس وقت دستیاب نہیں، "
                     "لیکن document search نے متعلقہ مواد تلاش کر لیا ہے۔\n\n"
-                    f"Technical error: {ai_error}"
+                    "Gemini is temporarily unavailable; the grounded RAG fallback is being shown instead."
                 )
 
             elif language == "Roman Urdu":
@@ -1897,14 +1934,14 @@ def answer_question(
                     "\n\nGemini explanation is waqt available nahi, "
                     "lekin document search ne relevant content "
                     "find kar liya hai.\n\n"
-                    f"Technical error: {ai_error}"
+                    "Gemini is temporarily unavailable; the grounded RAG fallback is being shown instead."
                 )
 
             else:
                 answer += (
                     "\n\nGemini explanation failed, but the document "
                     "search found relevant content.\n\n"
-                    f"Technical error: {ai_error}"
+                    "Gemini is temporarily unavailable; the grounded RAG fallback is being shown instead."
                 )
 
         return (
@@ -1953,14 +1990,12 @@ def answer_question(
 
     elif language == "Roman Urdu":
         fallback += (
-            "\n\nAI explanation is waqt available nahi, "
-            "lekin document mein relevant content mojood hai."
+            "\n\nGemini is waqt temporarily unavailable tha; upar grounded RAG answer diya gaya hai."
         )
 
     else:
         fallback += (
-            "\n\nAI explanation is temporarily unavailable, "
-            "but relevant content is present in the document."
+            "\n\nGemini is temporarily unavailable; the grounded RAG answer above is based on the uploaded document."
         )
 
     return (
