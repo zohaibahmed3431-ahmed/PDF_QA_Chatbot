@@ -1,0 +1,7 @@
+Smart Thermostat User Manual
+
+Temperature Control
+The thermostat supports a temperature range from 16 C to 30 C. Heating, cooling, and automatic modes are available. The schedule can store four temperature periods for each day.
+
+Maintenance and Warranty
+The air filter should be checked every 30 days. The product includes a two-year limited warranty from the date of purchase. Do not expose the thermostat to direct water.
