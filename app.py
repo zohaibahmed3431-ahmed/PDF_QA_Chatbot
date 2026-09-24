@@ -20,7 +20,7 @@ from pptx import Presentation
 from openpyxl import load_workbook
 from sentence_transformers import SentenceTransformer
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from google import genai, types
+from google import genai
 from google.genai import types
 
 
