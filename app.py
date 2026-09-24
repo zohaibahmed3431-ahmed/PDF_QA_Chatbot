@@ -1740,8 +1740,9 @@ STRICT RULES:
             except Exception as exc:
                 errors.append(f"{model}: {exc}")
 
+                error_text = str(exc)
                 transient = any(
-                    marker in last_error.upper()
+                    marker in error_text.upper()
                     for marker in (
                         "429",
                         "500",
@@ -2529,4 +2530,5 @@ st.caption(
     "Production-Style RAG AI Assistant • "
     "Hybrid lexical + semantic retrieval • Configurable chunking • OCR • Conversation history • Prompt-injection protection"
 )
+
 
