@@ -22,6 +22,7 @@ from sentence_transformers import SentenceTransformer
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from google import genai
 from google.genai import types
+from google.genai import types
 
 
 # ============================================================
@@ -573,7 +574,7 @@ def vision_extract_image_text(data, name):
     OCR remains the fallback. The model is instructed to transcribe visible
     text/labels only and not invent missing values.
     """
-    key = get_gemini_api_key()
+    key = get_api_key()
     if not key:
         return ""
 
@@ -2495,3 +2496,4 @@ st.caption(
     "Production-Style RAG AI Assistant • "
     "Hybrid lexical + semantic retrieval • Configurable chunking • OCR • Conversation history • Prompt-injection protection"
 )
+
