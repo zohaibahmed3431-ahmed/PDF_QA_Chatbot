@@ -2024,6 +2024,9 @@ if "vector_db" not in st.session_state:
 if "chunks" not in st.session_state:
     st.session_state.chunks = []
 
+if "document_records" not in st.session_state:
+    st.session_state.document_records = []
+
 if "unreadable_files" not in st.session_state:
     st.session_state.unreadable_files = []
 
@@ -2145,6 +2148,7 @@ if st.button(
                 if not records:
                     st.session_state.vector_db = None
                     st.session_state.chunks = []
+                    st.session_state.document_records = []
                     st.session_state.unreadable_files = unreadable
 
                     st.error(
@@ -2164,6 +2168,7 @@ if st.button(
 
                     st.session_state.vector_db = index
                     st.session_state.chunks = chunks
+                    st.session_state.document_records = records
                     st.session_state.unreadable_files = unreadable
 
                     st.session_state.processed_signature = current_signature
@@ -2659,7 +2664,8 @@ def deterministic_evaluation_candidates(chunks, scope_text, target_count, existi
 
 
 def generate_dynamic_evaluation_dataset(chunks, target_count, scope_text):
-    """Generate exactly target_count when possible, using only source-supported facts."""
+    """Generate up to 100,000 source-grounded evaluation questions."""
+    target_count = max(1, min(int(target_count), 100000))
     if not chunks:
         return [], ["No processed document content is available."]
 
@@ -2837,6 +2843,60 @@ def evaluate_rag(rows, index, chunks, language, use_gemini=False):
 
 
 # ============================================================
+# COMPLETE EXTRACTED DOCUMENT DETAILS
+# ============================================================
+
+def build_document_details_csv(records):
+    """Create a CSV containing all readable extracted document details."""
+    output = io.StringIO()
+    fieldnames = [
+        "id",
+        "source_file",
+        "page",
+        "location",
+        "extraction_method",
+        "record_id",
+        "details",
+    ]
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+
+    for index, record in enumerate(records[:100000], start=1):
+        writer.writerow({
+            "id": index,
+            "source_file": record.get("source", ""),
+            "page": record.get("page", "") if record.get("page") is not None else "",
+            "location": record.get("location", ""),
+            "extraction_method": record.get("method", ""),
+            "record_id": record.get("record_id", ""),
+            "details": record.get("text", ""),
+        })
+
+    return output.getvalue()
+
+
+if st.session_state.get("document_records"):
+    st.divider()
+    st.subheader("📋 Complete Document Details")
+    st.caption(
+        f"All readable details extracted from the currently processed documents. "
+        f"Maximum export size: 100,000 rows."
+    )
+
+    document_csv = build_document_details_csv(
+        st.session_state.document_records
+    )
+
+    st.download_button(
+        "⬇️ Download Complete Document Details CSV",
+        data=document_csv.encode("utf-8"),
+        file_name="complete_document_details.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+
+# ============================================================
 # INSIGHTBENCH — DOCUMENT-GROUNDED RAG EVALUATION
 # ============================================================
 
@@ -2862,10 +2922,10 @@ if show_evaluation:
         question_count = st.number_input(
             "How many evaluation questions do you want?",
             min_value=1,
-            max_value=200,
+            max_value=100000,
             value=25,
             step=1,
-            help="Maximum is 200 questions.",
+            help="Maximum is 100,000 questions.",
         )
 
         scope_mode = st.radio(
@@ -2975,14 +3035,14 @@ if show_evaluation:
                     "expected_answer_keywords": row["expected_answer_keywords"],
                     "evidence": row.get("evidence", ""),
                 }
-                for row in rows
+                for row in rows[:100000]
             ]
             output_questions = io.StringIO()
             writer = csv.DictWriter(output_questions, fieldnames=list(csv_rows[0].keys()))
             writer.writeheader()
             writer.writerows(csv_rows)
             st.download_button(
-                "⬇️ Download Generated Evaluation Questions",
+                "⬇️ Download RAG Evaluation Questions CSV",
                 data=output_questions.getvalue().encode("utf-8"),
                 file_name="rag_evaluation_generated.csv",
                 mime="text/csv",
@@ -3006,7 +3066,7 @@ if show_evaluation:
                     "Keyword Coverage": item["answer_keyword_coverage"],
                     "Status": item["answer_status"],
                 }
-                for item in st.session_state.evaluation_results
+                for item in st.session_state.evaluation_results[:100000]
             ],
             use_container_width=True,
             hide_index=True,
@@ -3016,7 +3076,7 @@ if show_evaluation:
         fieldnames = list(st.session_state.evaluation_results[0].keys())
         writer = csv.DictWriter(output, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(st.session_state.evaluation_results)
+        writer.writerows(st.session_state.evaluation_results[:100000])
 
         report_text = (
             "RAG Evaluation Report\n"
@@ -3030,7 +3090,7 @@ if show_evaluation:
         )
 
         st.download_button(
-            "⬇️ Download Evaluation CSV",
+            "⬇️ Download RAG Evaluation Results CSV",
             data=output.getvalue().encode("utf-8"),
             file_name="rag_evaluation_results.csv",
             mime="text/csv",
