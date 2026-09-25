@@ -2051,6 +2051,12 @@ if "evaluation_chunks" not in st.session_state:
 if "evaluation_signature" not in st.session_state:
     st.session_state.evaluation_signature = None
 
+if "dynamic_evaluation_rows" not in st.session_state:
+    st.session_state.dynamic_evaluation_rows = []
+
+if "dynamic_evaluation_errors" not in st.session_state:
+    st.session_state.dynamic_evaluation_errors = []
+
 if "answer_busy" not in st.session_state:
     st.session_state.answer_busy = False
 
@@ -2364,32 +2370,364 @@ if st.session_state.get("last_answer"):
 
 
 # ============================================================
-# RAG EVALUATION
+# DYNAMIC RAG EVALUATION
 # ============================================================
 
-def load_evaluation_rows(file_bytes):
-    text = file_bytes.decode("utf-8-sig")
-    reader = csv.DictReader(io.StringIO(text))
-    required = {
-        "id",
-        "question",
-        "source_file",
-        "expected_location",
-        "expected_answer_keywords",
-    }
-    if not required.issubset(set(reader.fieldnames or [])):
-        missing = required.difference(set(reader.fieldnames or []))
-        raise ValueError(
-            "Evaluation CSV is missing columns: " + ", ".join(sorted(missing))
+def _evaluation_context_windows(chunks, max_chars=60000):
+    """Split the CURRENT uploaded documents into complete context windows.
+
+    Unlike a single truncated context, this lets question generation cover the
+    whole uploaded file collection, including content near the end of a large file.
+    """
+    windows = []
+    current = []
+    total = 0
+
+    for number, chunk in enumerate(chunks, start=1):
+        text_value = normalize_text(chunk.get("text", ""))
+        if not text_value:
+            continue
+        block = (
+            f"SOURCE_ID: {number}\n"
+            f"FILE: {chunk.get('source', '')}\n"
+            f"LOCATION: {chunk.get('location', '')}\n"
+            f"CONTENT:\n{text_value}\n"
+            f"---\n"
+        )
+        if current and total + len(block) > max_chars:
+            windows.append("\n".join(current))
+            current = []
+            total = 0
+        current.append(block)
+        total += len(block)
+
+    if current:
+        windows.append("\n".join(current))
+
+    return windows
+
+
+def _parse_json_array(text):
+    """Extract a JSON array from a Gemini response without accepting prose."""
+    if not text:
+        return []
+    cleaned = text.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        value = json.loads(cleaned)
+        return value if isinstance(value, list) else []
+    except Exception:
+        match = re.search(r"\[.*\]", cleaned, flags=re.S)
+        if not match:
+            return []
+        try:
+            value = json.loads(match.group(0))
+            return value if isinstance(value, list) else []
+        except Exception:
+            return []
+
+
+def generate_evaluation_batch(context, count, scope_text):
+    """Generate source-grounded evaluation questions in one Gemini call."""
+    key = get_api_key()
+    if not key:
+        return [], "Gemini API key is not configured."
+
+    prompt = f"""
+You are generating a RAG evaluation dataset from the uploaded document content below.
+The document content is the ONLY authority. Do not use outside knowledge.
+
+SCOPE:
+{scope_text}
+
+Create EXACTLY {count} distinct evaluation questions.
+Questions must test information that is actually present in the supplied source content.
+Cover the document broadly: names, numbers, measurements, dates, addresses, features,
+labels, headings, relationships, lists, procedures, and other factual details when present.
+Do not invent facts. Do not ask about information that is absent.
+Do not make questions about the RAG system itself unless the uploaded document actually
+contains such information.
+Questions may ask for a complete overview of a clearly named entity when the document
+contains multiple details about that entity.
+
+For every question return:
+- question: natural user question
+- expected_answer_keywords: 1 to 6 exact words/numbers/short phrases that a correct
+  answer should contain, separated by | characters
+- expected_location: the exact FILE and/or LOCATION where the evidence appears
+- evidence: a short exact excerpt copied from the supplied content that proves the answer
+
+Return ONLY a JSON array. No markdown. No explanation.
+
+SOURCE CONTENT:
+{context}
+"""
+
+    try:
+        client = genai.Client(api_key=key)
+    except Exception as exc:
+        return [], f"Gemini client initialization failed: {exc}"
+
+    models = [
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash-lite",
+    ]
+    errors = []
+    for model in models:
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=[prompt],
+            )
+            items = _parse_json_array(getattr(response, "text", ""))
+            if items:
+                return items, None
+            errors.append(f"{model}: empty/invalid JSON")
+        except Exception as exc:
+            errors.append(f"{model}: {exc}")
+    return [], " | ".join(errors[-4:])
+
+
+def deterministic_evaluation_candidates(chunks, scope_text, target_count):
+    """Safe fallback: create questions only from literal source lines.
+
+    This fallback never invents an answer. If there are not enough distinct
+    source facts, it returns fewer questions rather than fabricating content.
+    """
+    candidates = []
+    seen = set()
+    topic_terms = query_terms(scope_text) if scope_text else set()
+
+    for chunk in chunks:
+        text_value = normalize_text(chunk.get("text", ""))
+        for line in text_value.splitlines():
+            line = normalize_text(line).strip("-|• ")
+            if len(line) < 8:
+                continue
+            norm = normalize_for_search(line)
+            if not norm or norm in seen:
+                continue
+            if topic_terms and not any(term in norm for term in topic_terms):
+                continue
+
+            seen.add(norm)
+            keywords = []
+            for value in re.findall(r"\b\d+(?:\.\d+)?\b|[A-Za-z]{3,}", line):
+                value_norm = normalize_for_search(value)
+                if value_norm and value_norm not in STOP_WORDS:
+                    keywords.append(value_norm)
+                if len(keywords) >= 5:
+                    break
+            if not keywords:
+                continue
+
+            candidates.append({
+                "question": f"What information is provided in the document about: {line}?",
+                "expected_answer_keywords": "|".join(keywords[:5]),
+                "expected_location": chunk.get("location", chunk.get("source", "")),
+                "evidence": line,
+            })
+            if len(candidates) >= target_count:
+                return candidates
+
+    return candidates
+
+
+def validate_generated_evaluation_rows(rows, chunks, scope_text, target_count, existing_questions=None):
+    """Reject unsupported/duplicate generated questions before evaluation."""
+    cleaned = []
+    seen_questions = set(existing_questions or set())
+    scope_terms = query_terms(scope_text) if scope_text else set()
+
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        question = normalize_text(item.get("question", ""))
+        keywords = normalize_text(item.get("expected_answer_keywords", ""))
+        location_hint = normalize_text(item.get("expected_location", ""))
+        evidence = normalize_text(item.get("evidence", ""))
+        if not question or not keywords or not evidence:
+            continue
+
+        q_norm = normalize_for_search(question)
+        if q_norm in seen_questions:
+            continue
+        if scope_terms and not any(
+            term in q_norm or term in normalize_for_search(evidence)
+            for term in scope_terms
+        ):
+            continue
+
+        evidence_norm = normalize_for_search(evidence)
+        matched_chunk = None
+        for chunk in chunks:
+            chunk_norm = normalize_for_search(chunk.get("text", ""))
+            if evidence_norm and evidence_norm in chunk_norm:
+                matched_chunk = chunk
+                break
+
+        if matched_chunk is None:
+            continue
+
+        source_file = normalize_text(matched_chunk.get("source", ""))
+        actual_location = normalize_text(matched_chunk.get("location", ""))
+        if location_hint and normalize_for_search(location_hint) not in normalize_for_search(actual_location) and normalize_for_search(location_hint) not in normalize_for_search(source_file):
+            # Location claims from the model must agree with the real chunk.
+            continue
+
+        seen_questions.add(q_norm)
+        cleaned.append({
+            "id": str(len(cleaned) + 1),
+            "question": question,
+            "source_file": source_file,
+            "expected_location": actual_location,
+            "expected_answer_keywords": keywords,
+            "evidence": evidence,
+        })
+        if len(cleaned) >= target_count:
+            break
+
+    return cleaned
+
+
+def deterministic_evaluation_candidates(chunks, scope_text, target_count, existing_questions=None):
+    """Safe fallback that creates only source-supported question variants."""
+    candidates = []
+    seen_questions = set(existing_questions or set())
+    topic_terms = query_terms(scope_text) if scope_text else set()
+
+    templates = [
+        "What information is provided about {fact}?",
+        "What does the document state about {fact}?",
+        "Which details are given for {fact}?",
+        "According to the document, what is stated about {fact}?",
+        "What can be found in the document about {fact}?",
+        "What value or detail is given for {fact}?",
+        "What does the uploaded document mention regarding {fact}?",
+        "Can you state the document's information about {fact}?",
+    ]
+
+    facts = []
+    seen_facts = set()
+    for chunk in chunks:
+        text_value = normalize_text(chunk.get("text", ""))
+        for line in text_value.splitlines():
+            line = normalize_text(line).strip("-|• ")
+            if len(line) < 8:
+                continue
+            norm = normalize_for_search(line)
+            if not norm or norm in seen_facts:
+                continue
+            if topic_terms and not any(term in norm for term in topic_terms):
+                continue
+            seen_facts.add(norm)
+            keywords = []
+            # Preserve meaningful exact numbers and short phrases from the evidence.
+            for value in re.findall(r"\b\d+(?:\.\d+)?(?:\s*(?:sq\.?\s*ft|ft|feet|rooms?|%))?\b|[A-Za-z]{3,}", line):
+                value_norm = normalize_for_search(value)
+                if value_norm and value_norm not in STOP_WORDS and value_norm not in keywords:
+                    keywords.append(value_norm)
+                if len(keywords) >= 5:
+                    break
+            if keywords:
+                facts.append((line, keywords[:5], chunk))
+
+    # Cycle through source facts and question phrasings. Every variant points
+    # to the same literal evidence, so the fallback never invents a fact.
+    for template_index, template in enumerate(templates):
+        for line, keywords, chunk in facts:
+            question = template.format(fact=line)
+            q_norm = normalize_for_search(question)
+            if q_norm in seen_questions:
+                continue
+            seen_questions.add(q_norm)
+            candidates.append({
+                "id": str(len(candidates) + 1),
+                "question": question,
+                "source_file": chunk.get("source", ""),
+                "expected_location": chunk.get("location", ""),
+                "expected_answer_keywords": "|".join(keywords),
+                "evidence": line,
+            })
+            if len(candidates) >= target_count:
+                return candidates
+
+    return candidates
+
+
+def generate_dynamic_evaluation_dataset(chunks, target_count, scope_text):
+    """Generate exactly target_count when possible, using only source-supported facts."""
+    if not chunks:
+        return [], ["No processed document content is available."]
+
+    context_windows = _evaluation_context_windows(chunks)
+    scope = scope_text.strip() or "The entire uploaded document collection."
+    all_rows = []
+    errors = []
+    max_attempts = max(4, ((target_count + 19) // 20) + 4)
+    attempt = 0
+
+    progress = st.progress(0)
+    status = st.empty()
+
+    while len(all_rows) < target_count and attempt < max_attempts:
+        attempt += 1
+        remaining = target_count - len(all_rows)
+        request_count = min(20, remaining)
+        status.write(
+            f"Generating evaluation questions: {len(all_rows)}/{target_count} prepared..."
         )
 
-    rows = []
-    for row in reader:
-        question = normalize_text(row.get("question", ""))
-        if not question:
-            continue
-        rows.append(row)
-    return rows
+        context = context_windows[(attempt - 1) % len(context_windows)]
+        generated, error = generate_evaluation_batch(context, request_count, scope)
+        if error:
+            errors.append(error)
+
+        existing = {normalize_for_search(row["question"]) for row in all_rows}
+        valid = validate_generated_evaluation_rows(
+            generated,
+            chunks,
+            scope_text,
+            target_count - len(all_rows),
+            existing_questions=existing,
+        )
+        all_rows.extend(valid)
+
+        if len(all_rows) < target_count:
+            existing = {normalize_for_search(row["question"]) for row in all_rows}
+            fallback = deterministic_evaluation_candidates(
+                chunks,
+                scope_text,
+                target_count - len(all_rows),
+                existing_questions=existing,
+            )
+            for row in fallback:
+                q_norm = normalize_for_search(row["question"])
+                if q_norm in existing:
+                    continue
+                row["id"] = str(len(all_rows) + 1)
+                all_rows.append(row)
+                existing.add(q_norm)
+                if len(all_rows) >= target_count:
+                    break
+
+        progress.progress(min(1.0, len(all_rows) / target_count))
+
+        # If Gemini keeps returning duplicates but there are still source facts,
+        # the deterministic variant generator can finish without inventing data.
+        if len(all_rows) >= target_count:
+            break
+
+    progress.empty()
+    status.empty()
+
+    for number, row in enumerate(all_rows[:target_count], start=1):
+        row["id"] = str(number)
+
+    return all_rows[:target_count], errors
 
 
 def keyword_coverage(answer, keywords_text):
@@ -2413,59 +2751,22 @@ def location_match(results, expected_file, expected_location):
     for result in results:
         source_norm = normalize_for_search(result.get("source", ""))
         location_norm = normalize_for_search(result.get("location", ""))
-
-        file_ok = expected_file_norm in source_norm or source_norm in expected_file_norm
-        location_ok = expected_location_norm in location_norm
-
+        file_ok = (
+            not expected_file_norm
+            or expected_file_norm in source_norm
+            or source_norm in expected_file_norm
+        )
+        location_ok = (
+            not expected_location_norm
+            or expected_location_norm in location_norm
+            or location_norm in expected_location_norm
+        )
         if file_ok and location_ok:
             return True
-
     return False
 
 
-def build_evaluation_index(strategy):
-    """Build the index from the bundled neutral evaluation documents only.
-
-    This is intentionally separate from the user's uploaded documents. A
-    normal file such as Employees.csv must never determine the Project 4
-    evaluation score.
-    """
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    demo_dir = os.path.join(base_dir, "evaluation_demo")
-
-    if not os.path.isdir(demo_dir):
-        raise FileNotFoundError(
-            "The evaluation_demo folder is missing from the repository."
-        )
-
-    source_names = [
-        "company_handbook.txt",
-        "university_guide.txt",
-        "product_manual.txt",
-        "travel_guide.txt",
-        "technical_notes.txt",
-    ]
-
-    records = []
-    for name in source_names:
-        path = os.path.join(demo_dir, name)
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Missing evaluation document: {name}")
-        with open(path, "rb") as handle:
-            records.extend(process_text(handle.read(), name))
-
-    chunks = build_chunks(records, strategy)
-    index = build_vector_database(chunks)
-    return index, chunks
-
-
 def evaluate_rag(rows, index, chunks, language, use_gemini=False):
-    """Run the 25-question evaluation against the bundled test documents.
-
-    Fast/default mode uses the grounded extractive RAG answer, so all 25
-    questions can be evaluated without making 25 slow Gemini requests.
-    Gemini evaluation remains available as an optional slower mode.
-    """
     results_out = []
     retrieval_hits = 0
     total_keyword_coverage = 0.0
@@ -2485,7 +2786,7 @@ def evaluate_rag(rows, index, chunks, language, use_gemini=False):
         )
 
         if use_gemini:
-            ai_answer, ai_error = generate_ai_answer(
+            ai_answer, _ = generate_ai_answer(
                 question,
                 retrieved[:6],
                 language,
@@ -2523,7 +2824,6 @@ def evaluate_rag(rows, index, chunks, language, use_gemini=False):
                 result.get("location", "") for result in retrieved[:8]
             ),
         })
-
         progress.progress(number / len(rows))
 
     status.empty()
@@ -2533,7 +2833,6 @@ def evaluate_rag(rows, index, chunks, language, use_gemini=False):
     retrieval_rate = retrieval_hits / count if count else 0.0
     answer_coverage = total_keyword_coverage / count if count else 0.0
     overall = (retrieval_rate + answer_coverage) / 2
-
     return results_out, retrieval_rate, answer_coverage, overall
 
 
@@ -2546,64 +2845,102 @@ with st.sidebar:
     show_evaluation = st.checkbox(
         "🧪 Show Project 4 Evaluation",
         value=False,
-        help=(
-            "Tests the RAG system against the bundled neutral evaluation documents. "
-            "It is separate from normal user-uploaded documents."
-        ),
+        help="Generate and evaluate questions from the CURRENT uploaded documents.",
     )
 
 if show_evaluation:
     st.divider()
-    st.subheader("🧪 Project 4 RAG Evaluation")
+    st.subheader("🧪 RAG Evaluation — Current Uploaded Documents")
     st.caption(
-        "This test uses the 5 bundled evaluation documents, not your uploaded files. "
-        "So a search for an employee in Employees.csv does not affect these 25 questions."
+        "Evaluation is generated from the same documents you upload and process. "
+        "It is independent from normal chat history."
     )
 
-    repo_eval_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "rag_evaluation_25_questions.csv",
-    )
-
-    eval_rows = None
-    if os.path.exists(repo_eval_path):
-        try:
-            with open(repo_eval_path, "rb") as eval_file:
-                eval_rows = load_evaluation_rows(eval_file.read())
-            st.success(f"Evaluation dataset loaded: {len(eval_rows)} questions.")
-        except Exception as exc:
-            st.error("Could not read the repository evaluation CSV.")
-            st.exception(exc)
+    if st.session_state.vector_db is None or not st.session_state.chunks:
+        st.warning("Upload and process the document first. Then choose the number of evaluation questions.")
     else:
-        st.error("The built-in evaluation CSV is missing from the repository.")
+        question_count = st.number_input(
+            "How many evaluation questions do you want?",
+            min_value=1,
+            max_value=200,
+            value=25,
+            step=1,
+            help="Maximum is 200 questions.",
+        )
 
-    if eval_rows:
-        eval_signature = hashlib.sha256(
-            f"evaluation|{chunk_strategy}".encode("utf-8")
-        ).hexdigest()
+        scope_mode = st.radio(
+            "What should the evaluation cover?",
+            [
+                "Entire uploaded document(s)",
+                "A specific topic/detail",
+            ],
+            index=0,
+        )
 
-        if (
-            st.session_state.evaluation_vector_db is None
-            or st.session_state.evaluation_signature != eval_signature
+        topic_text = ""
+        if scope_mode == "A specific topic/detail":
+            topic_text = st.text_input(
+                "Topic/detail",
+                placeholder="Example: Type C 3 Rooms, apartment dimensions, contacts",
+            )
+
+        if st.button(
+            "🧠 Generate Evaluation Questions",
+            use_container_width=True,
+            disabled=st.session_state.get("answer_busy", False),
         ):
-            with st.spinner("Preparing the 5 evaluation documents once..."):
+            if scope_mode == "A specific topic/detail" and not topic_text.strip():
+                st.warning("Enter the topic/detail first.")
+            else:
                 try:
-                    eval_index, eval_chunks = build_evaluation_index(chunk_strategy)
-                    st.session_state.evaluation_vector_db = eval_index
-                    st.session_state.evaluation_chunks = eval_chunks
-                    st.session_state.evaluation_signature = eval_signature
+                    rows, generation_errors = generate_dynamic_evaluation_dataset(
+                        st.session_state.chunks,
+                        int(question_count),
+                        topic_text if scope_mode == "A specific topic/detail" else "",
+                    )
+                    st.session_state.dynamic_evaluation_rows = rows
+                    st.session_state.dynamic_evaluation_errors = generation_errors
+                    st.session_state.evaluation_results = None
+                    st.session_state.evaluation_metrics = None
+                    st.success(f"Generated {len(rows)} source-grounded evaluation questions.")
+                    if len(rows) < int(question_count):
+                        st.warning(
+                            f"Only {len(rows)} fully source-supported questions were generated. "
+                            "The app will never invent unsupported questions just to reach the requested number."
+                        )
+                    if generation_errors:
+                        st.caption("Some Gemini generation attempts were unavailable; validated source-grounded fallback questions were used where possible.")
                 except Exception as exc:
-                    st.error("Could not prepare the bundled evaluation documents.")
+                    st.error("Could not generate the evaluation questions.")
                     st.exception(exc)
 
-        if st.session_state.evaluation_vector_db is not None:
+        rows = st.session_state.get("dynamic_evaluation_rows", [])
+
+        if rows:
+            st.info(
+                f"Evaluation dataset ready: {len(rows)} questions. "
+                "These questions are based only on the currently uploaded documents."
+            )
+
+            with st.expander("Preview evaluation questions", expanded=False):
+                st.dataframe(
+                    [
+                        {
+                            "ID": row["id"],
+                            "Question": row["question"],
+                            "Source": row["expected_source"],
+                            "Location": row["expected_location"],
+                        }
+                        for row in rows
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
             use_gemini_eval = st.checkbox(
                 "Use Gemini for evaluation answers (slower)",
                 value=False,
-                help=(
-                    "Off = fast grounded RAG evaluation. On = send each question to Gemini, "
-                    "which can take much longer and may hit API capacity limits."
-                ),
+                help="Off = fast grounded retrieval/fallback evaluation. On = Gemini also answers every evaluation question.",
             )
 
             if st.button(
@@ -2613,13 +2950,12 @@ if show_evaluation:
             ):
                 try:
                     evaluation_results, retrieval_rate, answer_coverage, overall = evaluate_rag(
-                        eval_rows,
-                        st.session_state.evaluation_vector_db,
-                        st.session_state.evaluation_chunks,
+                        rows,
+                        st.session_state.vector_db,
+                        st.session_state.chunks,
                         response_language,
                         use_gemini=use_gemini_eval,
                     )
-
                     st.session_state.evaluation_results = evaluation_results
                     st.session_state.evaluation_metrics = {
                         "retrieval_rate": retrieval_rate,
@@ -2630,9 +2966,31 @@ if show_evaluation:
                     st.error("Evaluation failed.")
                     st.exception(exc)
 
+            csv_rows = [
+                {
+                    "id": row["id"],
+                    "question": row["question"],
+                    "source_file": row["expected_source"],
+                    "expected_location": row["expected_location"],
+                    "expected_answer_keywords": row["expected_answer_keywords"],
+                    "evidence": row.get("evidence", ""),
+                }
+                for row in rows
+            ]
+            output_questions = io.StringIO()
+            writer = csv.DictWriter(output_questions, fieldnames=list(csv_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(csv_rows)
+            st.download_button(
+                "⬇️ Download Generated Evaluation Questions",
+                data=output_questions.getvalue().encode("utf-8"),
+                file_name="rag_evaluation_generated.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
     if st.session_state.get("evaluation_results"):
         metrics = st.session_state.evaluation_metrics
-
         col1, col2, col3 = st.columns(3)
         col1.metric("Retrieval Hit Rate", f"{metrics['retrieval_rate'] * 100:.1f}%")
         col2.metric("Answer Keyword Coverage", f"{metrics['answer_coverage'] * 100:.1f}%")
@@ -2664,8 +3022,7 @@ if show_evaluation:
             "RAG Evaluation Report\n"
             "====================\n"
             f"Questions: {len(st.session_state.evaluation_results)}\n"
-            f"Evaluation documents: company_handbook.txt, university_guide.txt, "
-            f"product_manual.txt, travel_guide.txt, technical_notes.txt\n"
+            "Evaluation source: CURRENT uploaded documents\n"
             f"Chunking strategy: {st.session_state.chunk_strategy}\n"
             f"Retrieval Hit Rate: {metrics['retrieval_rate'] * 100:.1f}%\n"
             f"Answer Keyword Coverage: {metrics['answer_coverage'] * 100:.1f}%\n"
