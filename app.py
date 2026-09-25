@@ -2036,6 +2036,15 @@ if "evaluation_results" not in st.session_state:
 if "evaluation_metrics" not in st.session_state:
     st.session_state.evaluation_metrics = None
 
+# Persist the latest Q&A across Streamlit reruns (for example when
+# Project 4 Evaluation is opened). This prevents the visible answer/question
+# from disappearing when the app reruns.
+if "last_question" not in st.session_state:
+    st.session_state.last_question = ""
+
+if "last_answer" not in st.session_state:
+    st.session_state.last_answer = ""
+
 st.session_state.chunk_strategy = chunk_strategy
 
 
@@ -2225,11 +2234,16 @@ if st.session_state.chat_history:
 
 if st.button("🧹 Clear Conversation"):
     st.session_state.chat_history = []
+    st.session_state.last_question = ""
+    st.session_state.last_answer = ""
+    st.session_state.last_question_hash = None
+    st.session_state.last_question_time = 0.0
     st.rerun()
 
-with st.form("document_question_form", clear_on_submit=True):
+with st.form("document_question_form", clear_on_submit=False):
     question = st.text_input(
         "Question",
+        key="document_question_input",
         placeholder=(
             "Ask anything about the uploaded files. "
             "Any topic, any file type, any question is supported. "
@@ -2300,13 +2314,30 @@ if ask_submitted:
                     "time": datetime.now().isoformat(timespec="seconds"),
                 })
 
-                st.markdown(answer)
+                # Persist the latest result so it survives any later Streamlit
+                # rerun (including opening/running RAG Evaluation).
+                st.session_state.last_question = question
+                st.session_state.last_answer = answer
 
             except Exception as exc:
                 st.error(
                     "An unexpected error occurred while answering."
                 )
                 st.exception(exc)
+
+
+# ============================================================
+# PERSISTENT LATEST RESULT
+# ============================================================
+
+# Streamlit reruns the script whenever a widget changes. Keep the latest
+# document answer visible even when the user opens/runs Project 4 Evaluation.
+if st.session_state.get("last_answer"):
+    st.divider()
+    st.subheader("📌 Latest Document Result")
+    if st.session_state.get("last_question"):
+        st.caption(f"Question: {st.session_state.last_question}")
+    st.markdown(st.session_state.last_answer)
 
 
 # ============================================================
@@ -2573,5 +2604,4 @@ st.caption(
     "Production-Style RAG AI Assistant • "
     "Hybrid lexical + semantic retrieval • Configurable chunking • OCR • Conversation history • Prompt-injection protection"
 )
-
 
