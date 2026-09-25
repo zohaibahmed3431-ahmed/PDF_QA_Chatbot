@@ -2847,7 +2847,12 @@ def evaluate_rag(rows, index, chunks, language, use_gemini=False):
 # ============================================================
 
 def build_document_details_csv(records):
-    """Create a CSV containing all readable extracted document details."""
+    """Create a detailed, row-by-row CSV of all readable extracted content.
+
+    Each meaningful line/item becomes its own CSV row so an image or scanned
+    document does not collapse into one huge ``details`` cell.  OCR and Vision
+    sections are kept separately when the extractor produced both.
+    """
     output = io.StringIO()
     fieldnames = [
         "id",
@@ -2855,22 +2860,73 @@ def build_document_details_csv(records):
         "page",
         "location",
         "extraction_method",
+        "detail_type",
         "record_id",
         "details",
     ]
     writer = csv.DictWriter(output, fieldnames=fieldnames)
     writer.writeheader()
 
-    for index, record in enumerate(records[:100000], start=1):
+    row_id = 0
+
+    def emit(record, detail_type, detail_text, method=None):
+        nonlocal row_id
+        detail_text = normalize_text(str(detail_text or ""))
+        if not detail_text:
+            return
+        row_id += 1
+        if row_id > 100000:
+            return
         writer.writerow({
-            "id": index,
+            "id": row_id,
             "source_file": record.get("source", ""),
             "page": record.get("page", "") if record.get("page") is not None else "",
             "location": record.get("location", ""),
-            "extraction_method": record.get("method", ""),
+            "extraction_method": method or record.get("method", ""),
+            "detail_type": detail_type,
             "record_id": record.get("record_id", ""),
-            "details": record.get("text", ""),
+            "details": detail_text,
         })
+
+    for record in records:
+        if row_id >= 100000:
+            break
+
+        text = str(record.get("text", "") or "")
+        if not text.strip():
+            continue
+
+        # Image extraction stores OCR and Vision in the same record. Split
+        # them so the CSV exposes every extracted detail instead of one cell.
+        sections = []
+        current_type = "Extracted text"
+        current_lines = []
+
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            marker = line.lower().rstrip(":")
+            if marker in {"ocr transcription", "vision transcription"}:
+                if current_lines:
+                    sections.append((current_type, current_lines))
+                current_type = (
+                    "OCR" if marker == "ocr transcription" else "Vision"
+                )
+                current_lines = []
+            elif line:
+                current_lines.append(line)
+
+        if current_lines:
+            sections.append((current_type, current_lines))
+
+        if not sections:
+            continue
+
+        for detail_type, lines in sections:
+            # Preserve each meaningful line/item as a separate row.
+            for line in lines:
+                if row_id >= 100000:
+                    break
+                emit(record, detail_type, line)
 
     return output.getvalue()
 
