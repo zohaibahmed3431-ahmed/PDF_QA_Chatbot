@@ -5,6 +5,7 @@ import re
 import time
 import hashlib
 import json
+import threading
 from datetime import datetime
 from difflib import SequenceMatcher
 
@@ -22,6 +23,11 @@ from sentence_transformers import SentenceTransformer
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from google import genai
 from google.genai import types
+
+
+# Prevent two Enter/button submissions from running the same question
+# concurrently in one Streamlit session.
+QUESTION_LOCK = threading.Lock()
 
 
 # ============================================================
@@ -2036,6 +2042,18 @@ if "evaluation_results" not in st.session_state:
 if "evaluation_metrics" not in st.session_state:
     st.session_state.evaluation_metrics = None
 
+if "evaluation_vector_db" not in st.session_state:
+    st.session_state.evaluation_vector_db = None
+
+if "evaluation_chunks" not in st.session_state:
+    st.session_state.evaluation_chunks = []
+
+if "evaluation_signature" not in st.session_state:
+    st.session_state.evaluation_signature = None
+
+if "answer_busy" not in st.session_state:
+    st.session_state.answer_busy = False
+
 # Persist the latest Q&A across Streamlit reruns (for example when
 # Project 4 Evaluation is opened). This prevents the visible answer/question
 # from disappearing when the app reruns.
@@ -2253,39 +2271,43 @@ with st.form("document_question_form", clear_on_submit=False):
     ask_submitted = st.form_submit_button(
         "🔍 Ask",
         use_container_width=True,
+        disabled=st.session_state.get("answer_busy", False),
     )
 
 
 if ask_submitted:
     if st.session_state.vector_db is None:
-        st.warning(
-            "Please upload and process your files first."
-        )
+        st.warning("Please upload and process your files first.")
 
     elif not question.strip():
-        st.warning(
-            "Please enter a question."
-        )
+        st.warning("Please enter a question.")
 
     else:
-        # Prevent accidental double-submission when Enter/button is pressed twice.
         normalized_question = " ".join(question.split()).casefold()
-        question_hash = hashlib.sha256(normalized_question.encode("utf-8")).hexdigest()
+        question_hash = hashlib.sha256(
+            normalized_question.encode("utf-8")
+        ).hexdigest()
         now = time.time()
         previous_hash = st.session_state.get("last_question_hash")
         previous_time = st.session_state.get("last_question_time", 0.0)
 
+        # Ignore accidental duplicate Enter/button submissions.
         if previous_hash == question_hash and (now - previous_time) < 10:
             st.info("This question was just submitted. Please wait for the current result.")
             st.stop()
 
+        # A non-blocking process lock prevents a second simultaneous Streamlit
+        # run from starting another expensive Gemini/RAG request.
+        if not QUESTION_LOCK.acquire(blocking=False):
+            st.warning("A question is already being processed. Please wait for its result.")
+            st.stop()
+
+        st.session_state.answer_busy = True
         st.session_state.last_question_hash = question_hash
         st.session_state.last_question_time = now
 
-        with st.spinner(
-            "Searching the complete document collection..."
-        ):
-            try:
+        try:
+            with st.spinner("Searching the complete document collection..."):
                 injection_matches = detect_prompt_injection(question)
 
                 if injection_matches:
@@ -2315,15 +2337,16 @@ if ask_submitted:
                 })
 
                 # Persist the latest result so it survives any later Streamlit
-                # rerun (including opening/running RAG Evaluation).
+                # rerun, including opening/running RAG Evaluation.
                 st.session_state.last_question = question
                 st.session_state.last_answer = answer
 
-            except Exception as exc:
-                st.error(
-                    "An unexpected error occurred while answering."
-                )
-                st.exception(exc)
+        except Exception as exc:
+            st.error("An unexpected error occurred while answering.")
+            st.exception(exc)
+        finally:
+            st.session_state.answer_busy = False
+            QUESTION_LOCK.release()
 
 
 # ============================================================
@@ -2400,7 +2423,49 @@ def location_match(results, expected_file, expected_location):
     return False
 
 
-def evaluate_rag(rows, index, chunks, language):
+def build_evaluation_index(strategy):
+    """Build the index from the bundled neutral evaluation documents only.
+
+    This is intentionally separate from the user's uploaded documents. A
+    normal file such as Employees.csv must never determine the Project 4
+    evaluation score.
+    """
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    demo_dir = os.path.join(base_dir, "evaluation_demo")
+
+    if not os.path.isdir(demo_dir):
+        raise FileNotFoundError(
+            "The evaluation_demo folder is missing from the repository."
+        )
+
+    source_names = [
+        "company_handbook.txt",
+        "university_guide.txt",
+        "product_manual.txt",
+        "travel_guide.txt",
+        "technical_notes.txt",
+    ]
+
+    records = []
+    for name in source_names:
+        path = os.path.join(demo_dir, name)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Missing evaluation document: {name}")
+        with open(path, "rb") as handle:
+            records.extend(process_text(handle.read(), name))
+
+    chunks = build_chunks(records, strategy)
+    index = build_vector_database(chunks)
+    return index, chunks
+
+
+def evaluate_rag(rows, index, chunks, language, use_gemini=False):
+    """Run the 25-question evaluation against the bundled test documents.
+
+    Fast/default mode uses the grounded extractive RAG answer, so all 25
+    questions can be evaluated without making 25 slow Gemini requests.
+    Gemini evaluation remains available as an optional slower mode.
+    """
     results_out = []
     retrieval_hits = 0
     total_keyword_coverage = 0.0
@@ -2419,20 +2484,22 @@ def evaluate_rag(rows, index, chunks, language):
             row.get("expected_location", ""),
         )
 
-        history = "No previous conversation."
-        ai_answer, ai_error = generate_ai_answer(
-            question,
-            retrieved[:6],
-            language,
-            history,
-        )
-
-        if ai_answer:
-            answer = ai_answer
-            answer_status = "AI answer"
+        if use_gemini:
+            ai_answer, ai_error = generate_ai_answer(
+                question,
+                retrieved[:6],
+                language,
+                "No previous conversation.",
+            )
+            if ai_answer:
+                answer = ai_answer
+                answer_status = "AI answer"
+            else:
+                answer = deterministic_answer(question, retrieved, language)
+                answer_status = "Grounded fallback"
         else:
             answer = deterministic_answer(question, retrieved, language)
-            answer_status = "Fallback answer"
+            answer_status = "Grounded RAG answer"
 
         coverage = keyword_coverage(
             answer,
@@ -2480,8 +2547,8 @@ with st.sidebar:
         "🧪 Show Project 4 Evaluation",
         value=False,
         help=(
-            "Optional evaluation mode. The repository evaluation dataset is "
-            "specific to the project's test documents; it is not part of normal Q&A."
+            "Tests the RAG system against the bundled neutral evaluation documents. "
+            "It is separate from normal user-uploaded documents."
         ),
     )
 
@@ -2489,8 +2556,8 @@ if show_evaluation:
     st.divider()
     st.subheader("🧪 Project 4 RAG Evaluation")
     st.caption(
-        "Optional evaluation mode. Normal document Q&A is universal and is not "
-        "limited to these test questions."
+        "This test uses the 5 bundled evaluation documents, not your uploaded files. "
+        "So a search for an employee in Employees.csv does not affect these 25 questions."
     )
 
     repo_eval_path = os.path.join(
@@ -2508,24 +2575,49 @@ if show_evaluation:
             st.error("Could not read the repository evaluation CSV.")
             st.exception(exc)
     else:
-        st.error(
-            "The built-in evaluation dataset is missing from the repository. "
-            "This is a Project 4 test dataset, not a normal document upload."
-        )
-        st.caption(
-            "Normal PDF/CSV/DOCX/XLSX files belong in the main document uploader above. "
-            "Do not upload a normal data CSV such as Employees.csv as an evaluation dataset."
-        )
+        st.error("The built-in evaluation CSV is missing from the repository.")
 
-    if eval_rows and st.session_state.vector_db is not None:
-        if st.button("▶️ Run RAG Evaluation", use_container_width=True):
-            with st.spinner("Running evaluation. This may take a few minutes..."):
+    if eval_rows:
+        eval_signature = hashlib.sha256(
+            f"evaluation|{chunk_strategy}".encode("utf-8")
+        ).hexdigest()
+
+        if (
+            st.session_state.evaluation_vector_db is None
+            or st.session_state.evaluation_signature != eval_signature
+        ):
+            with st.spinner("Preparing the 5 evaluation documents once..."):
+                try:
+                    eval_index, eval_chunks = build_evaluation_index(chunk_strategy)
+                    st.session_state.evaluation_vector_db = eval_index
+                    st.session_state.evaluation_chunks = eval_chunks
+                    st.session_state.evaluation_signature = eval_signature
+                except Exception as exc:
+                    st.error("Could not prepare the bundled evaluation documents.")
+                    st.exception(exc)
+
+        if st.session_state.evaluation_vector_db is not None:
+            use_gemini_eval = st.checkbox(
+                "Use Gemini for evaluation answers (slower)",
+                value=False,
+                help=(
+                    "Off = fast grounded RAG evaluation. On = send each question to Gemini, "
+                    "which can take much longer and may hit API capacity limits."
+                ),
+            )
+
+            if st.button(
+                "▶️ Run RAG Evaluation",
+                use_container_width=True,
+                disabled=st.session_state.get("answer_busy", False),
+            ):
                 try:
                     evaluation_results, retrieval_rate, answer_coverage, overall = evaluate_rag(
                         eval_rows,
-                        st.session_state.vector_db,
-                        st.session_state.chunks,
+                        st.session_state.evaluation_vector_db,
+                        st.session_state.evaluation_chunks,
                         response_language,
+                        use_gemini=use_gemini_eval,
                     )
 
                     st.session_state.evaluation_results = evaluation_results
@@ -2572,6 +2664,8 @@ if show_evaluation:
             "RAG Evaluation Report\n"
             "====================\n"
             f"Questions: {len(st.session_state.evaluation_results)}\n"
+            f"Evaluation documents: company_handbook.txt, university_guide.txt, "
+            f"product_manual.txt, travel_guide.txt, technical_notes.txt\n"
             f"Chunking strategy: {st.session_state.chunk_strategy}\n"
             f"Retrieval Hit Rate: {metrics['retrieval_rate'] * 100:.1f}%\n"
             f"Answer Keyword Coverage: {metrics['answer_coverage'] * 100:.1f}%\n"
