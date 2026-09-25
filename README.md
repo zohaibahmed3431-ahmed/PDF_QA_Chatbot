@@ -1,119 +1,66 @@
-# Universal Document Q&A Assistant — Production-Style RAG
-
-A Streamlit-based document question-answering system that combines document extraction, OCR, embeddings, vector search, RAG prompting, conversation history, source citations, prompt-injection protection, and evaluation.
-
-## What it supports
-
-- Multiple document uploads in one session
-- PDF and scanned PDF processing
-- DOCX, TXT, PPTX, XLSX, CSV
-- JPG, JPEG, PNG, WEBP image documents
-- OCR with Tesseract for scanned/image content
-- Gemini multimodal vision as a supplemental image transcription layer
-- Configurable chunking strategies:
-  - Balanced (850 / 140)
-  - Small (500 / 80)
-  - Large (1200 / 180)
-- Sentence-transformer embeddings
-- FAISS vector database
-- Hybrid lexical + semantic retrieval
-- RAG-grounded Gemini answer generation
-- Original image bytes supplied to Gemini for image questions
-- Conversation history
-- Source/document/page display
-- Prompt-injection detection and context sanitization
-- Deterministic grounded fallback when Gemini is temporarily unavailable
-- 25-question evaluation mode with retrieval-hit rate and keyword coverage
-- Downloadable evaluation CSV and report
-
-## Architecture
-
+Universal Document Q&A Assistant — Dynamic RAG Evaluation
+A Streamlit-based universal document Q&A system with OCR, embeddings, FAISS hybrid retrieval, Gemini multimodal answers, source locations, conversation history, prompt-injection protection, and dynamic RAG evaluation generated from the documents currently uploaded by the user.
+Main features
+Multiple uploads: PDF, scanned PDF, DOCX, TXT, PPTX, XLSX, CSV, JPG/JPEG/PNG/WEBP
+OCR for scanned/image documents
+Sentence-transformer embeddings + FAISS
+Hybrid lexical + semantic retrieval
+Gemini grounded answers with original image support
+Conversation history and source locations
+Prompt-injection protection
+Deterministic grounded fallback when Gemini is temporarily unavailable
+Configurable chunking:
+Small: 500 / 80
+Balanced: 850 / 140
+Large: 1200 / 180
+Duplicate question submission protection
+Latest document result remains visible during evaluation
+Dynamic RAG Evaluation
+The evaluation is not tied to Malka Noor, Employees.csv, or the old 25-question test set.
+Upload and process the document(s) you actually want to evaluate.
+Open Project 4 RAG Evaluation.
+The app asks how many questions you want, from 1 to 200.
+Choose either:
+Entire uploaded document(s) — questions cover the whole processed document collection.
+A specific topic/detail — questions are restricted to the topic you enter.
+Click Generate Evaluation Questions.
+The app generates source-grounded questions and validates every question against actual extracted document evidence.
+Download the generated evaluation CSV.
+Run the RAG evaluation against the same uploaded documents.
+Important accuracy rule
+The app must not invent facts just to reach the requested number. If Gemini is unavailable or the document does not contain enough distinct supportable facts, the app uses validated source-line question variants where possible and otherwise reports the actual number it could support.
+For example, if you enter 125, the app attempts to produce 125 questions. Every question must be traceable to actual content in the uploaded documents. It will never invent a source, page, measurement, name, date, or other fact.
+Evaluation isolation
+A normal user query such as Awais against `Employees.csv` remains normal document Q&A. It does not become part of the evaluation dataset unless `Employees.csv` is the document currently selected/uploaded for evaluation.
+Metrics
+Retrieval Hit Rate
+Answer Keyword Coverage
+Combined Evaluation Score
+Default evaluation mode is fast and grounded. The optional Gemini-answer mode is slower because it sends each evaluation question to Gemini.
+Architecture
 ```mermaid
 flowchart LR
     A[User] --> B[Streamlit UI]
     B --> C[Upload Documents]
-    C --> D[Extract Text / PDF / Office / OCR]
-    D --> E[Chunking Strategy]
-    E --> F[Sentence Transformer Embeddings]
-    F --> G[FAISS Vector Index]
-    B --> H[Question + Conversation History]
+    C --> D[Extract / OCR]
+    D --> E[Chunking]
+    E --> F[Embeddings]
+    F --> G[FAISS]
+    B --> H[Question]
     H --> I[Hybrid Retrieval]
     G --> I
-    I --> J[Prompt Injection Sanitization]
-    J --> K[Gemini Multimodal RAG]
-    K --> L[Grounded Answer + Sources]
-    K -. temporary 503 .-> M[Deterministic RAG Fallback]
-    M --> L
-    L --> B
-    G --> N[Evaluation: Retrieval + Keyword Coverage]
+    I --> J[Gemini / Grounded Fallback]
+    J --> K[Answer + Sources]
+    C --> L[Dynamic Evaluation Question Generator]
+    L --> M[Validated Evaluation Dataset]
+    M --> N[RAG Evaluation]
+    N --> O[Metrics + CSV + Report]
 ```
-
-## RAG flow
-
-1. Upload 5–10 or more documents.
-2. Extract text and OCR scanned/image content.
-3. Split content using the selected chunking strategy.
-4. Create embeddings with `all-MiniLM-L6-v2`.
-5. Store vectors in FAISS.
-6. Retrieve relevant chunks using lexical and semantic signals.
-7. Sanitize retrieved context against prompt injection.
-8. Send question + retrieved context + conversation history to Gemini.
-9. For image sources, also send the original image bytes to the multimodal model.
-10. Return the answer together with document/page/source references.
-11. If Gemini is temporarily unavailable, return a grounded extractive RAG answer instead of crashing.
-
-## Chunking comparison
-
-| Strategy | Chunk size | Overlap | Typical use |
-|---|---:|---:|---|
-| Small | 500 | 80 | Precise short facts |
-| Balanced | 850 | 140 | General-purpose RAG |
-| Large | 1200 | 180 | Context-heavy documents |
-
-Use the same evaluation dataset with each strategy and compare retrieval hit rate and answer keyword coverage.
-
-## Evaluation
-
-The chatbot itself is universal: it is not tied to any property, company, university, or other domain.
-
-The repository includes a separate neutral evaluation corpus in `evaluation_demo/` and a 25-question ground-truth dataset in `rag_evaluation_25_questions.csv`. The demo corpus covers company policy, university guidance, a product manual, travel information, and RAG technical notes. This corpus exists only to demonstrate the evaluation methodology; it is not hardcoded into normal document Q&A.
-
-For a final university report, you can replace the evaluation CSV with 20–30 questions based on your own project documents using the same columns.
-
-Required CSV columns:
-
-- `id`
-- `question`
-- `source_file`
-- `expected_location`
-- `expected_answer_keywords`
-
-Metrics shown by the app:
-
-- Retrieval Hit Rate
-- Answer Keyword Coverage
-- Combined Evaluation Score
-
-These are simple project-level metrics, not a substitute for human evaluation.
-
-## Run locally
-
+Run
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
-
-For scanned PDFs/images, install Tesseract OCR and the required language packages on the host.
-
-## Streamlit deployment
-
-1. Push `app.py`, `requirements.txt`, `packages.txt`, `rag_evaluation_25_questions.csv`, `README.md`, and the `evaluation_demo/` folder to GitHub.
-2. Create a Streamlit Community Cloud app from the repository.
-3. Add `GEMINI_API_KEY` in Streamlit Secrets.
-4. Deploy/reboot the app.
-
-Do **not** put the Gemini API key inside GitHub source code.
-
-## Gemini availability behavior
-
-The app uses current Gemini Flash-family model IDs. Gemini service capacity errors such as HTTP 503 are external availability conditions. The application therefore tries configured current models and then falls back to grounded document extraction so a temporary Gemini outage does not make the entire RAG demo unusable.
+For scanned PDFs/images, install Tesseract OCR on the host.
+Streamlit
+Add `GEMINI_API_KEY` to Streamlit Secrets. Never put the API key in GitHub source code.
