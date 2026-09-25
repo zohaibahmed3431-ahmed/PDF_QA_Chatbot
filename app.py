@@ -35,16 +35,16 @@ QUESTION_LOCK = threading.Lock()
 # ============================================================
 
 st.set_page_config(
-    page_title="Universal Document Q&A Assistant",
+    page_title="DocuSphere AI",
     page_icon="📚",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.title("📚 Universal Document Q&A Assistant")
+st.title("📚 DocuSphere AI")
 st.caption(
     "Upload documents, search their contents, ask questions, and get "
-    "answers with exact source locations."
+    "source-grounded answers with exact source locations."
 )
 
 
@@ -86,7 +86,7 @@ with st.sidebar:
             "Small (500 / 80)",
             "Large (1200 / 180)",
         ],
-        help="Project 4 allows chunking strategies to be compared."
+        help="Choose how the document is split into searchable chunks."
     )
 
     st.divider()
@@ -1662,7 +1662,7 @@ CONTENT:
     context = "\n".join(context_parts)
 
     prompt = f"""
-You are a professional Universal Document Q&A Assistant.
+You are the professional AI assistant inside DocuSphere AI.
 
 The uploaded documents are the ONLY authority.
 
@@ -2061,7 +2061,7 @@ if "answer_busy" not in st.session_state:
     st.session_state.answer_busy = False
 
 # Persist the latest Q&A across Streamlit reruns (for example when
-# Project 4 Evaluation is opened). This prevents the visible answer/question
+ # This prevents the visible answer/question
 # from disappearing when the app reruns.
 if "last_question" not in st.session_state:
     st.session_state.last_question = ""
@@ -2360,7 +2360,7 @@ if ask_submitted:
 # ============================================================
 
 # Streamlit reruns the script whenever a widget changes. Keep the latest
-# document answer visible even when the user opens/runs Project 4 Evaluation.
+# Keep the latest document answer visible when InsightBench is opened or run.
 if st.session_state.get("last_answer"):
     st.divider()
     st.subheader("📌 Latest Document Result")
@@ -2814,7 +2814,7 @@ def evaluate_rag(rows, index, chunks, language, use_gemini=False):
         results_out.append({
             "id": row.get("id", str(number)),
             "question": question,
-            "expected_source": row.get("source_file", ""),
+            "source_file": row.get("source_file", ""),
             "expected_location": row.get("expected_location", ""),
             "retrieval_hit": "Yes" if retrieval_ok else "No",
             "answer_keyword_coverage": round(coverage, 3),
@@ -2837,20 +2837,20 @@ def evaluate_rag(rows, index, chunks, language, use_gemini=False):
 
 
 # ============================================================
-# OPTIONAL PROJECT 4 EVALUATION
+# INSIGHTBENCH — DOCUMENT-GROUNDED RAG EVALUATION
 # ============================================================
 
 with st.sidebar:
     st.divider()
     show_evaluation = st.checkbox(
-        "🧪 Show Project 4 Evaluation",
+        "🧪 Show InsightBench",
         value=False,
         help="Generate and evaluate questions from the CURRENT uploaded documents.",
     )
 
 if show_evaluation:
     st.divider()
-    st.subheader("🧪 RAG Evaluation — Current Uploaded Documents")
+    st.subheader("🧪 InsightBench — Document-Grounded RAG Evaluation")
     st.caption(
         "Evaluation is generated from the same documents you upload and process. "
         "It is independent from normal chat history."
@@ -2928,8 +2928,8 @@ if show_evaluation:
                         {
                             "ID": row["id"],
                             "Question": row["question"],
-                            "Source": row["expected_source"],
-                            "Location": row["expected_location"],
+                            "Source": row.get("source_file", ""),
+                            "Location": row.get("expected_location", ""),
                         }
                         for row in rows
                     ],
@@ -2970,8 +2970,8 @@ if show_evaluation:
                 {
                     "id": row["id"],
                     "question": row["question"],
-                    "source_file": row["expected_source"],
-                    "expected_location": row["expected_location"],
+                    "source_file": row.get("source_file", ""),
+                    "expected_location": row.get("expected_location", ""),
                     "expected_answer_keywords": row["expected_answer_keywords"],
                     "evidence": row.get("evidence", ""),
                 }
