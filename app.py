@@ -2847,125 +2847,139 @@ def evaluate_rag(rows, index, chunks, language, use_gemini=False):
 # ============================================================
 
 def build_document_details_csv(records):
-    """Export complete, human-readable extracted document details.
+    """Export document extraction without turning OCR noise into fake details.
 
-    The CSV keeps the original OCR/Vision transcription intact and also adds
-    meaningful detail rows. It deliberately does NOT create one row per OCR
-    character/garbage fragment.
+    For image/scanned records, OCR is exported as ONE complete transcription and
+    Vision as ONE complete transcription plus meaningful Vision lines. This is
+    intentional: Tesseract can return single characters/garbage fragments, and
+    those fragments are not independent document details.
+
+    For normal text documents, each meaningful non-empty line is exported.
+    Maximum export size: 100,000 rows.
     """
     output = io.StringIO()
     fieldnames = [
-        "id",
-        "source_file",
-        "page",
-        "location",
-        "extraction_method",
-        "detail_type",
-        "record_id",
-        "details",
+        "id", "source_file", "page", "location", "extraction_method",
+        "detail_type", "record_id", "details",
     ]
     writer = csv.DictWriter(output, fieldnames=fieldnames)
     writer.writeheader()
-
     row_id = 0
+    seen_rows = set()
 
-    def clean_line(value):
+    def clean(value):
         return normalize_text(str(value or "")).strip()
-
-    def meaningful_line(value):
-        line = clean_line(value)
-        if not line:
-            return ""
-        # Ignore obvious OCR noise while retaining useful short values such
-        # as "C", "02", "TV", dimensions, room labels, etc.
-        alnum = sum(ch.isalnum() for ch in line)
-        if alnum == 0:
-            return ""
-        if len(line) <= 2 and not any(ch.isdigit() for ch in line):
-            return ""
-        return line
 
     def emit(record, detail_type, detail_text, method=None):
         nonlocal row_id
-        detail_text = clean_line(detail_text)
-        if not detail_text or row_id >= 100000:
+        text = clean(detail_text)
+        if not text or row_id >= 100000:
             return
+        key = (
+            clean(record.get("record_id", "")),
+            clean(detail_type),
+            normalize_for_search(text),
+        )
+        if key in seen_rows:
+            return
+        seen_rows.add(key)
         row_id += 1
         writer.writerow({
             "id": row_id,
-            "source_file": record.get("source", ""),
+            "source_file": clean(record.get("source", "")),
             "page": record.get("page", "") if record.get("page") is not None else "",
-            "location": record.get("location", ""),
-            "extraction_method": method or record.get("method", ""),
+            "location": clean(record.get("location", "")),
+            "extraction_method": method or clean(record.get("method", "")),
             "detail_type": detail_type,
-            "record_id": record.get("record_id", ""),
-            "details": detail_text,
+            "record_id": clean(record.get("record_id", "")),
+            "details": text,
         })
 
     for record in records:
         if row_id >= 100000:
             break
 
-        raw_text = record.get("text", "") or ""
-        if isinstance(raw_text, (list, tuple)):
-            raw_text = "\n".join(str(x) for x in raw_text)
-        text = str(raw_text)
-        if not text.strip():
+        raw = record.get("text", "") or ""
+        if isinstance(raw, (list, tuple)):
+            raw = "\n".join(str(x) for x in raw)
+        text = str(raw).strip()
+        if not text:
             continue
 
-        # Split the combined image extraction into OCR and Vision sections.
-        # If no section markers exist, treat it as the record's normal text.
-        sections = []
-        current_type = "Extracted text"
-        current_lines = []
-        for raw_line in text.splitlines():
-            line = raw_line.strip()
-            marker = line.lower().rstrip(":")
-            if marker in {"ocr transcription", "vision transcription"}:
-                if current_lines:
-                    sections.append((current_type, current_lines))
-                current_type = "OCR" if marker == "ocr transcription" else "Vision"
-                current_lines = []
-            elif line:
-                current_lines.append(line)
-        if current_lines:
-            sections.append((current_type, current_lines))
+        method = clean(record.get("method", ""))
+        is_image_record = (
+            "ocr" in method.lower() or "vision" in method.lower()
+            or method.lower() == "image"
+            or record.get("image_data") is not None
+        )
 
-        for detail_type, lines in sections:
-            if row_id >= 100000:
-                break
+        # Image/scanned document: never make one row per OCR fragment.
+        if is_image_record:
+            sections = []
+            current_type = "Extracted text"
+            current_lines = []
 
-            # Preserve the complete section once. This prevents a bad OCR
-            # segmentation from destroying the actual extracted information.
-            full_section = "\n".join(clean_line(x) for x in lines if clean_line(x))
-            if full_section:
+            for raw_line in text.splitlines():
+                line = clean(raw_line)
+                marker = line.lower().rstrip(":").strip()
+                if marker in {"ocr transcription", "ocr text"}:
+                    if current_lines:
+                        sections.append((current_type, current_lines))
+                    current_type = "OCR"
+                    current_lines = []
+                elif marker in {"vision transcription", "vision text", "gemini vision transcription"}:
+                    if current_lines:
+                        sections.append((current_type, current_lines))
+                    current_type = "Vision"
+                    current_lines = []
+                elif line:
+                    current_lines.append(line)
+            if current_lines:
+                sections.append((current_type, current_lines))
+
+            for detail_type, lines in sections:
+                if row_id >= 100000:
+                    break
+                complete = "\n".join(lines).strip()
+                if not complete:
+                    continue
+
+                # Always preserve the complete extraction exactly as a logical
+                # record. This is the important row for OCR because it keeps all
+                # detected text together instead of exposing OCR noise fragments.
                 emit(
                     record,
                     f"{detail_type} - Complete",
-                    full_section,
-                    method=f"{record.get('method', '')}:{detail_type.lower()}",
+                    complete,
+                    method=f"{method}:{detail_type.lower()}",
                 )
 
-            # For Vision/normal extraction, expose meaningful individual lines
-            # as separate details. OCR gets filtered because it commonly
-            # produces fragmented noise on posters/flyers.
-            for raw_line in lines:
-                if row_id >= 100000:
-                    break
-                line = meaningful_line(raw_line)
-                if not line:
-                    continue
-                if detail_type == "OCR":
-                    # Skip very short OCR fragments; the complete OCR row
-                    # above already preserves the original transcription.
-                    if len(line) < 4 and not any(ch.isdigit() for ch in line):
-                        continue
-                emit(
-                    record,
-                    detail_type,
-                    line,
-                    method=f"{record.get('method', '')}:{detail_type.lower()}",
-                )
+                # Only Vision is split into individual lines. Vision output is
+                # semantic transcription; OCR output is deliberately NOT split.
+                if detail_type == "Vision":
+                    for line in lines:
+                        if row_id >= 100000:
+                            break
+                        if len(clean(line)) >= 3:
+                            emit(
+                                record,
+                                "Vision Detail",
+                                line,
+                                method=f"{method}:vision",
+                            )
+            continue
+
+        # Normal text/PDF/DOCX/etc.: preserve complete text and meaningful lines.
+        emit(
+            record,
+            "Document Text - Complete",
+            text,
+            method=method,
+        )
+        for line in text.splitlines():
+            line = clean(line)
+            if len(line) >= 2:
+                emit(record, "Document Detail", line, method=method)
 
     return output.getvalue()
 
