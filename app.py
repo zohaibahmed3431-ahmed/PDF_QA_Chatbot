@@ -2326,43 +2326,49 @@ if st.session_state.unreadable_files:
 
 
 # ============================================================
+# ============================================================
 # SEARCH / QUESTION AREA
 # ============================================================
 
 st.divider()
-
 st.subheader("💬 Ask Your Document")
 
+# Render the conversation like a normal AI chat: every turn stays visible,
+# and the next question box remains available underneath it.
 if st.session_state.chat_history:
-    with st.expander("Conversation History", expanded=False):
-        for item in st.session_state.chat_history:
-            st.markdown(f"**You:** {item['question']}")
-            st.markdown(f"**Assistant:** {item['answer']}")
-            st.divider()
+    for item in st.session_state.chat_history:
+        with st.chat_message("user"):
+            st.markdown(item["question"])
+        with st.chat_message("assistant"):
+            st.markdown(item["answer"])
 
-if st.button("🧹 Clear Conversation"):
+if st.session_state.chat_history:
+    st.divider()
+
+with st.form("document_question_form", clear_on_submit=True):
+    question = st.text_input(
+        "Ask another question",
+        key="document_question_input",
+        placeholder=(
+            "Ask a follow-up, ask for an example, modify code, explain it easier, "
+            "or ask anything about your uploaded files…"
+        ),
+        label_visibility="collapsed",
+    )
+    ask_submitted = st.form_submit_button(
+        "➤ Send",
+        use_container_width=True,
+        disabled=st.session_state.get("answer_busy", False),
+    )
+
+# Keep a simple clear control outside the form so it does not interrupt typing.
+if st.button("🧹 Clear Conversation", use_container_width=False):
     st.session_state.chat_history = []
     st.session_state.last_question = ""
     st.session_state.last_answer = ""
     st.session_state.last_question_hash = None
     st.session_state.last_question_time = 0.0
     st.rerun()
-
-with st.form("document_question_form", clear_on_submit=False):
-    question = st.text_input(
-        "Question",
-        key="document_question_input",
-        placeholder=(
-            "Ask anything about the uploaded files. "
-            "Any topic, any file type, any question is supported. "
-            "Press Enter to search."
-        ),
-    )
-    ask_submitted = st.form_submit_button(
-        "🔍 Ask",
-        use_container_width=True,
-        disabled=st.session_state.get("answer_busy", False),
-    )
 
 
 if ask_submitted:
@@ -2386,11 +2392,9 @@ if ask_submitted:
             if st.session_state.get("answer_busy", False):
                 st.info("This question is still being processed. Please wait for the current result.")
             else:
-                st.info("This question was already processed. The latest result is shown below.")
+                st.info("This question was already processed. The latest result is shown above.")
             st.stop()
 
-        # A non-blocking process lock prevents a second simultaneous Streamlit
-        # run from starting another expensive Gemini/RAG request.
         if not QUESTION_LOCK.acquire(blocking=False):
             st.warning("A question is already being processed. Please wait for its result.")
             st.stop()
@@ -2400,7 +2404,7 @@ if ask_submitted:
         st.session_state.last_question_time = now
 
         try:
-            with st.spinner("Searching the complete document collection..."):
+            with st.spinner("Thinking and searching your document context..."):
                 injection_matches = detect_prompt_injection(question)
 
                 if injection_matches:
@@ -2410,9 +2414,11 @@ if ask_submitted:
                         "and will not follow requests to reveal or change system instructions."
                     )
 
+                # Give the model the recent conversation so follow-up requests like
+                # "make that code easier" or "change those values" retain context.
                 history_text = "\n".join(
                     f"User: {item['question']}\nAssistant: {item['answer']}"
-                    for item in st.session_state.chat_history[-6:]
+                    for item in st.session_state.chat_history[-12:]
                 )
 
                 answer = answer_question(
@@ -2430,10 +2436,12 @@ if ask_submitted:
                     "time": datetime.now().isoformat(timespec="seconds"),
                 })
 
-                # Persist the latest result so it survives any later Streamlit
-                # rerun, including opening/running RAG Evaluation.
                 st.session_state.last_question = question
                 st.session_state.last_answer = answer
+
+                # Immediately rerun so the newly completed turn appears in the
+                # permanent chat transcript and a fresh question box is shown below it.
+                st.rerun()
 
         except Exception as exc:
             st.error("An unexpected error occurred while answering.")
@@ -2443,8 +2451,6 @@ if ask_submitted:
             QUESTION_LOCK.release()
 
 
-# ============================================================
-# PERSISTENT LATEST RESULT
 # ============================================================
 
 # Streamlit reruns the script whenever a widget changes. Keep the latest
