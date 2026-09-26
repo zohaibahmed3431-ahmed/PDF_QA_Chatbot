@@ -1869,116 +1869,39 @@ def deterministic_answer(
 # ============================================================
 
 def build_complete_details_answer(records, language="English"):
-    """Return a professional, complete, source-grounded overview.
-
-    Image documents are presented as structured details instead of one long OCR
-    paragraph. Text/PDF/Office documents keep their complete readable content.
-    Nothing is inferred beyond the extracted source text.
-    """
+    """Return a complete, source-grounded overview of every uploaded document."""
     if not records:
         return "No readable document content is available."
 
-    def clean(v):
-        v = str(v or "").replace("\x00", " ")
-        v = re.sub(r"[ \t]+", " ", v)
-        return v.strip(" -•*|")
+    parts = []
+    for record in records:
+        text = normalize_text(record.get("text", ""))
+        if not text:
+            continue
+        source = record.get("source", "Unknown document")
+        page = record.get("page")
+        location = record.get("location", source)
 
-    def get_vision(text):
+        # Prefer the vision transcription for image documents.
         m = re.search(
             r"(?is)vision\s+(?:transcription|text)\s*:\s*(.*?)(?=\n\s*ocr\s+(?:transcription|text)\s*:|\Z)",
             text,
         )
-        return clean(m.group(1)) if m else ""
+        readable = normalize_text(m.group(1)) if m else text
 
-    def is_noise(line):
-        line = clean(line)
-        if len(line) < 2:
-            return True
-        if re.fullmatch(r"[\\/*|_~`^.,;:'\"\-]+", line):
-            return True
-        return False
-
-    def is_measurement(line):
-        return bool(re.search(r"\d+\s*['’]\s*-?\s*\d+|\d+(?:\.\d+)?\s*(?:sq\.?\s*ft|sqft)", line, re.I))
-
-    def section_for(line):
-        low = line.lower()
-        if re.search(r"\b(contact|phone|mobile|tel)\b", low):
-            return "Contact"
-        if re.search(r"\b(fl\s*\d|block|scheme|town|road|avenue|malir|karachi|address)\b", low):
-            return "Location"
-        if re.search(r"\b(prayer|play area|security|cctv|lift|water|gym|generator|parking)\b", low):
-            return "Facilities & Features"
-        if re.search(r"\b(tv lounge|entrance|kitchen|bedroom|bathroom|terrace|rooms?|sq\.?\s*ft|apartment|type c)\b", low):
-            return "Property Details"
-        if re.search(r"\b(residency|marketing|company|organization)\b", low):
-            return "Organization / Property"
-        return "Other Document Details"
-
-    parts = []
-    for record in records:
-        text = clean(record.get("text", ""))
-        if not text:
-            continue
-        source = clean(record.get("source", "Unknown document"))
-        page = record.get("page")
-        method = clean(record.get("method", ""))
-        ext = source.lower().rsplit(".", 1)[-1] if "." in source else ""
-        is_image = ext in {"jpg", "jpeg", "png", "webp"} or "vision" in method.lower()
-
-        heading = f"### {source}"
+        title = f"### {source}"
         if page not in (None, "", "nan"):
-            heading += f" — Page {page}"
-
-        if not is_image:
-            parts.append(heading + "\n\n" + text)
-            continue
-
-        readable = get_vision(text) or text
-        raw_lines = [clean(x) for x in readable.splitlines()]
-        lines = [x for x in raw_lines if x and not is_noise(x)]
-
-        sections = {}
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            nxt = lines[i + 1] if i + 1 < len(lines) else ""
-
-            # Keep a label and its measurement/value together.
-            if nxt and is_measurement(nxt) and not is_measurement(line):
-                sections.setdefault(section_for(line), []).append(f"**{line}:** {nxt}")
-                i += 2
-                continue
-
-            # Keep address/contact strings intact.
-            sections.setdefault(section_for(line), []).append(line)
-            i += 1
-
-        section_order = [
-            "Organization / Property",
-            "Property Details",
-            "Facilities & Features",
-            "Location",
-            "Contact",
-            "Other Document Details",
-        ]
-        body = []
-        for sec in section_order:
-            values = sections.get(sec, [])
-            if not values:
-                continue
-            body.append(f"**{sec}**\n" + "\n".join(f"- {v}" for v in values))
-
-        parts.append(heading + "\n\n" + "\n\n".join(body))
+            title += f" — Page {page}"
+        parts.append(f"{title}\n**Source:** {location}\n\n{readable}")
 
     if not parts:
         return "No readable document content is available."
 
     intro = {
-        "English": "## Complete document details\n\nHere is the complete readable information extracted from the uploaded document(s), organized into professional sections. No outside facts have been added.",
-        "Roman Urdu": "## Document ki complete details\n\nNeeche uploaded document(s) se nikali hui tamam readable information professional sections mein organize ki gayi hai. Bahar se koi fact add nahi kiya gaya.",
-        "Urdu": "## دستاویز کی مکمل تفصیلات\n\nذیل میں اپ لوڈ کی گئی دستاویزات سے حاصل شدہ تمام قابلِ مطالعہ معلومات کو پیشہ ورانہ حصوں میں منظم کیا گیا ہے۔ باہر سے کوئی معلومات شامل نہیں کی گئی۔",
-    }.get(language, "## Complete document details\n\nHere is the complete readable information extracted from the uploaded document(s), organized into professional sections. No outside facts have been added.")
+        "English": "## Complete document details\n\nBelow is the complete readable content available from the uploaded document collection. No facts have been added outside the documents.",
+        "Roman Urdu": "## Document ki complete details\n\nNeeche uploaded documents se available tamam readable content diya gaya hai. Bahar se koi fact add nahi kiya gaya.",
+        "Urdu": "## دستاویز کی مکمل تفصیلات\n\nذیل میں اپ لوڈ کی گئی دستاویزات سے دستیاب تمام قابلِ مطالعہ مواد دیا گیا ہے۔ باہر سے کوئی معلومات شامل نہیں کی گئی۔",
+    }.get(language, "## Complete document details\n\nBelow is the complete readable content available from the uploaded document collection.")
 
     return intro + "\n\n" + "\n\n---\n\n".join(parts)
 
@@ -2006,8 +1929,29 @@ def answer_question(
 
     # IMPORTANT: a generic full-details request must NOT be limited to the
     # top semantic search results. Return the entire uploaded collection.
-    if normalized_question in full_detail_requests and document_records:
-        return build_complete_details_answer(document_records, language)
+    if normalized_question in full_detail_requests:
+        # Full-details mode must never fall back to top-k RAG retrieval.
+        # Prefer the original extracted records; if they are unavailable,
+        # reconstruct source records from the current searchable chunks.
+        complete_records = document_records or []
+        if not complete_records and chunks:
+            complete_records = []
+            seen_sources = set()
+            for chunk in chunks:
+                source = chunk.get("source", "Unknown document")
+                page = chunk.get("page", "")
+                key = (source, str(page), chunk.get("record_id", ""))
+                if key in seen_sources:
+                    continue
+                seen_sources.add(key)
+                complete_records.append({
+                    "source": source,
+                    "page": page,
+                    "location": chunk.get("location", source),
+                    "method": chunk.get("method", ""),
+                    "text": chunk.get("text", ""),
+                })
+        return build_complete_details_answer(complete_records, language)
 
     results = find_relevant_results(
         question,
@@ -2433,7 +2377,10 @@ if ask_submitted:
 
         # Ignore accidental duplicate Enter/button submissions.
         if previous_hash == question_hash and (now - previous_time) < 10:
-            st.info("This question was just submitted. Please wait for the current result.")
+            if st.session_state.get("answer_busy", False):
+                st.info("This question is still being processed. Please wait for the current result.")
+            else:
+                st.info("This question was already processed. The latest result is shown below.")
             st.stop()
 
         # A non-blocking process lock prevents a second simultaneous Streamlit
@@ -2970,418 +2917,4 @@ def evaluate_rag(rows, index, chunks, language, use_gemini=False):
     answer_coverage = total_keyword_coverage / count if count else 0.0
     overall = (retrieval_rate + answer_coverage) / 2
     return results_out, retrieval_rate, answer_coverage, overall
-
-
-# ============================================================
-# COMPLETE EXTRACTED DOCUMENT DETAILS
-# ============================================================
-
-def build_document_details_csv(records):
-    """Create a professional, complete document-content CSV.
-
-    The export is a normalized data table, not a character-level OCR dump.
-    Image documents use the vision transcription as the readable source and
-    create meaningful fact rows where possible. Text/PDF/Office documents are
-    exported paragraph-by-paragraph so the complete readable content remains
-    available for books, reports, manuals, spreadsheets, etc.
-    Maximum export size: 100,000 rows.
-    """
-    output = io.StringIO()
-    fieldnames = [
-        "Record ID", "Source File", "Page", "Source Location",
-        "Extraction Method", "Record Type", "Category", "Field", "Value"
-    ]
-    writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
-    writer.writeheader()
-
-    row_id = 0
-    seen = set()
-
-    def clean(value):
-        value = str(value or "")
-        value = value.replace("\x00", " ")
-        value = re.sub(r"[ \t]+", " ", value)
-        value = re.sub(r"\n{3,}", "\n\n", value)
-        return value.strip()
-
-    def noisy(value):
-        v = clean(value)
-        if len(v) < 2:
-            return True
-        if re.fullmatch(r"[\\/*|_~`^.,;:'\"\-]+", v):
-            return True
-        # Very short OCR garbage such as "gf", "ty", "R\\" is excluded.
-        if len(v) <= 4 and not re.search(r"\d{2,}|[A-Za-z]{3,}", v):
-            return True
-        return False
-
-    def emit(record, category, field, value, record_type="Fact", method=None):
-        nonlocal row_id
-        value = clean(value)
-        if not value or noisy(value) or row_id >= 100000:
-            return
-        source = clean(record.get("source", ""))
-        page = record.get("page", "")
-        location = clean(record.get("location", source))
-        extraction = clean(method or record.get("method", ""))
-        category = clean(category)
-        field = clean(field)
-        key = (
-            source, str(page), category.lower(), field.lower(),
-            normalize_for_search(value), record_type.lower()
-        )
-        if key in seen:
-            return
-        seen.add(key)
-        row_id += 1
-        writer.writerow({
-            "Record ID": f"DOC-{row_id:06d}",
-            "Source File": source,
-            "Page": page if page is not None else "",
-            "Source Location": location,
-            "Extraction Method": extraction,
-            "Record Type": record_type,
-            "Category": category,
-            "Field": field,
-            "Value": value,
-        })
-
-    def vision_section(text):
-        # process_image() stores OCR and Vision in one record. Prefer Vision,
-        # because it is normally the readable interpretation of an image.
-        m = re.search(
-            r"(?is)vision\s+(?:transcription|text)\s*:\s*(.*?)(?=\n\s*ocr\s+(?:transcription|text)\s*:|\Z)",
-            text,
-        )
-        return clean(m.group(1)) if m else ""
-
-    def classify(line):
-        low = line.lower()
-        if re.search(r"\b(address|block|scheme|town|road|avenue|malir|karachi)\b", low):
-            return "Location", "Address"
-        if re.search(r"\b(contact|phone|mobile|tel)\b", low):
-            return "Contact", "Phone"
-        if re.search(r"\b(rooms?|sq\.?\s*ft|apartment|bedroom|bathroom|kitchen|lounge|terrace|entrance)\b", low):
-            return "Property Detail", "Detail"
-        if re.search(r"\b(security|cctv|lift|water|gym|generator|prayer|play area|parking)\b", low):
-            return "Facility / Feature", "Feature"
-        if re.search(r"\b(residency|marketing|company|organization)\b", low):
-            return "Organization / Property", "Name"
-        return "Document Content", "Detail"
-
-    for record in records:
-        if row_id >= 100000:
-            break
-        text = clean(record.get("text", ""))
-        if not text:
-            continue
-
-        method = clean(record.get("method", ""))
-        source = clean(record.get("source", ""))
-        ext = source.lower().rsplit(".", 1)[-1] if "." in source else ""
-        is_image = ext in {"jpg", "jpeg", "png", "webp"} or "vision" in method.lower()
-
-        if is_image:
-            vision = vision_section(text)
-            readable = vision or text
-
-            # Preserve the complete readable transcription exactly as one
-            # professional source record. This prevents loss of any detail.
-            emit(
-                record,
-                "Complete Document",
-                "Full Transcription",
-                readable,
-                record_type="Full Transcription",
-                method="vision" if vision else method,
-            )
-
-            # Also create structured rows from meaningful visual lines.
-            lines = [clean(x).lstrip("-•* ") for x in readable.splitlines()]
-            lines = [x for x in lines if x and not noisy(x)]
-            i = 0
-            while i < len(lines) and row_id < 100000:
-                line = lines[i]
-                nxt = lines[i + 1] if i + 1 < len(lines) else ""
-
-                # Label + measurement/value on the following line.
-                if nxt and (
-                    re.search(r"\d+\s*['’]\s*-?\s*\d+", nxt)
-                    or re.search(r"\b\d+\s+rooms?\b", nxt, re.I)
-                ):
-                    emit(record, *classify(line), value=nxt, method="vision")
-                    i += 2
-                    continue
-
-                phones = re.findall(r"\b(?:\+?\d[\d\s()\-]{7,}\d)\b", line)
-                if phones:
-                    for phone in phones:
-                        emit(record, "Contact", "Phone", re.sub(r"\s+", " ", phone).strip(), method="vision")
-                    i += 1
-                    continue
-
-                category, field = classify(line)
-                emit(record, category, field, line, method="vision")
-                i += 1
-            continue
-
-        # For normal documents, preserve complete readable content in logical
-        # paragraphs/rows. This is suitable for books and long reports.
-        blocks = [clean(x) for x in re.split(r"\n\s*\n+", text) if clean(x)]
-        if not blocks:
-            blocks = [text]
-        for number, block in enumerate(blocks, start=1):
-            # Keep paragraphs intact; do not invent fields from arbitrary prose.
-            emit(
-                record,
-                "Document Content",
-                f"Section {number}",
-                block,
-                record_type="Content",
-                method=method,
-            )
-
-    return output.getvalue()
-
-
-if st.session_state.get("document_records"):
-    st.divider()
-    st.subheader("📋 Complete Document Details")
-    st.caption(
-        f"All readable details extracted from the currently processed documents. "
-        f"Maximum export size: 100,000 rows."
-    )
-
-    document_csv = build_document_details_csv(
-        st.session_state.document_records
-    )
-
-    st.download_button(
-        "⬇️ Download Complete Document Details CSV",
-        data=document_csv.encode("utf-8"),
-        file_name="complete_document_details.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-
-
-# ============================================================
-# INSIGHTBENCH — DOCUMENT-GROUNDED RAG EVALUATION
-# ============================================================
-
-with st.sidebar:
-    st.divider()
-    show_evaluation = st.checkbox(
-        "🧪 Show InsightBench",
-        value=False,
-        help="Generate and evaluate questions from the CURRENT uploaded documents.",
-    )
-
-if show_evaluation:
-    st.divider()
-    st.subheader("🧪 InsightBench — Document-Grounded RAG Evaluation")
-    st.caption(
-        "Evaluation is generated from the same documents you upload and process. "
-        "It is independent from normal chat history."
-    )
-
-    if st.session_state.vector_db is None or not st.session_state.chunks:
-        st.warning("Upload and process the document first. Then choose the number of evaluation questions.")
-    else:
-        question_count = st.number_input(
-            "How many evaluation questions do you want?",
-            min_value=1,
-            max_value=100000,
-            value=25,
-            step=1,
-            help="Maximum is 100,000 questions.",
-        )
-
-        scope_mode = st.radio(
-            "What should the evaluation cover?",
-            [
-                "Entire uploaded document(s)",
-                "A specific topic/detail",
-            ],
-            index=0,
-        )
-
-        topic_text = ""
-        if scope_mode == "A specific topic/detail":
-            topic_text = st.text_input(
-                "Topic/detail",
-                placeholder="Example: Type C 3 Rooms, apartment dimensions, contacts",
-            )
-
-        if st.button(
-            "🧠 Generate Evaluation Questions",
-            use_container_width=True,
-            disabled=st.session_state.get("answer_busy", False),
-        ):
-            if scope_mode == "A specific topic/detail" and not topic_text.strip():
-                st.warning("Enter the topic/detail first.")
-            else:
-                try:
-                    rows, generation_errors = generate_dynamic_evaluation_dataset(
-                        st.session_state.chunks,
-                        int(question_count),
-                        topic_text if scope_mode == "A specific topic/detail" else "",
-                    )
-                    st.session_state.dynamic_evaluation_rows = rows
-                    st.session_state.dynamic_evaluation_errors = generation_errors
-                    st.session_state.evaluation_results = None
-                    st.session_state.evaluation_metrics = None
-                    st.success(f"Generated {len(rows)} source-grounded evaluation questions.")
-                    if len(rows) < int(question_count):
-                        st.warning(
-                            f"Only {len(rows)} fully source-supported questions were generated. "
-                            "The app will never invent unsupported questions just to reach the requested number."
-                        )
-                    if generation_errors:
-                        st.caption("Some Gemini generation attempts were unavailable; validated source-grounded fallback questions were used where possible.")
-                except Exception as exc:
-                    st.error("Could not generate the evaluation questions.")
-                    st.exception(exc)
-
-        rows = st.session_state.get("dynamic_evaluation_rows", [])
-
-        if rows:
-            st.info(
-                f"Evaluation dataset ready: {len(rows)} questions. "
-                "These questions are based only on the currently uploaded documents."
-            )
-
-            with st.expander("Preview evaluation questions", expanded=False):
-                st.dataframe(
-                    [
-                        {
-                            "ID": row["id"],
-                            "Question": row["question"],
-                            "Source": row.get("source_file", ""),
-                            "Location": row.get("expected_location", ""),
-                        }
-                        for row in rows
-                    ],
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-            use_gemini_eval = st.checkbox(
-                "Use Gemini for evaluation answers (slower)",
-                value=False,
-                help="Off = fast grounded retrieval/fallback evaluation. On = Gemini also answers every evaluation question.",
-            )
-
-            if st.button(
-                "▶️ Run RAG Evaluation",
-                use_container_width=True,
-                disabled=st.session_state.get("answer_busy", False),
-            ):
-                try:
-                    evaluation_results, retrieval_rate, answer_coverage, overall = evaluate_rag(
-                        rows,
-                        st.session_state.vector_db,
-                        st.session_state.chunks,
-                        response_language,
-                        use_gemini=use_gemini_eval,
-                    )
-                    st.session_state.evaluation_results = evaluation_results
-                    st.session_state.evaluation_metrics = {
-                        "retrieval_rate": retrieval_rate,
-                        "answer_coverage": answer_coverage,
-                        "overall": overall,
-                    }
-                except Exception as exc:
-                    st.error("Evaluation failed.")
-                    st.exception(exc)
-
-            csv_rows = [
-                {
-                    "id": row["id"],
-                    "question": row["question"],
-                    "source_file": row.get("source_file", ""),
-                    "expected_location": row.get("expected_location", ""),
-                    "expected_answer_keywords": row["expected_answer_keywords"],
-                    "evidence": row.get("evidence", ""),
-                }
-                for row in rows[:100000]
-            ]
-            output_questions = io.StringIO()
-            writer = csv.DictWriter(output_questions, fieldnames=list(csv_rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(csv_rows)
-            st.download_button(
-                "⬇️ Download RAG Evaluation Questions CSV",
-                data=output_questions.getvalue().encode("utf-8"),
-                file_name="rag_evaluation_generated.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-
-    if st.session_state.get("evaluation_results"):
-        metrics = st.session_state.evaluation_metrics
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Retrieval Hit Rate", f"{metrics['retrieval_rate'] * 100:.1f}%")
-        col2.metric("Answer Keyword Coverage", f"{metrics['answer_coverage'] * 100:.1f}%")
-        col3.metric("Combined Evaluation Score", f"{metrics['overall'] * 100:.1f}%")
-
-        st.markdown("### Evaluation Results")
-        st.dataframe(
-            [
-                {
-                    "ID": item["id"],
-                    "Question": item["question"],
-                    "Retrieval Hit": item["retrieval_hit"],
-                    "Keyword Coverage": item["answer_keyword_coverage"],
-                    "Status": item["answer_status"],
-                }
-                for item in st.session_state.evaluation_results[:100000]
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        output = io.StringIO()
-        fieldnames = list(st.session_state.evaluation_results[0].keys())
-        writer = csv.DictWriter(output, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(st.session_state.evaluation_results[:100000])
-
-        report_text = (
-            "RAG Evaluation Report\n"
-            "====================\n"
-            f"Questions: {len(st.session_state.evaluation_results)}\n"
-            "Evaluation source: CURRENT uploaded documents\n"
-            f"Chunking strategy: {st.session_state.chunk_strategy}\n"
-            f"Retrieval Hit Rate: {metrics['retrieval_rate'] * 100:.1f}%\n"
-            f"Answer Keyword Coverage: {metrics['answer_coverage'] * 100:.1f}%\n"
-            f"Combined Evaluation Score: {metrics['overall'] * 100:.1f}%\n"
-        )
-
-        st.download_button(
-            "⬇️ Download RAG Evaluation Results CSV",
-            data=output.getvalue().encode("utf-8"),
-            file_name="rag_evaluation_results.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-
-        st.download_button(
-            "⬇️ Download Evaluation Report",
-            data=report_text.encode("utf-8"),
-            file_name="rag_evaluation_report.txt",
-            mime="text/plain",
-            use_container_width=True,
-        )
-
-# ============================================================
-# FOOTER
-# ============================================================
-
-st.divider()
-
-st.caption(
-    "Production-Style RAG AI Assistant • "
-    "Hybrid lexical + semantic retrieval • Configurable chunking • OCR • Conversation history • Prompt-injection protection"
-)
 
