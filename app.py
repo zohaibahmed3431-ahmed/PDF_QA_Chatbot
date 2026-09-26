@@ -1929,8 +1929,29 @@ def answer_question(
 
     # IMPORTANT: a generic full-details request must NOT be limited to the
     # top semantic search results. Return the entire uploaded collection.
-    if normalized_question in full_detail_requests and document_records:
-        return build_complete_details_answer(document_records, language)
+    if normalized_question in full_detail_requests:
+        # Full-details mode must never fall back to top-k RAG retrieval.
+        # Prefer the original extracted records; if they are unavailable,
+        # reconstruct source records from the current searchable chunks.
+        complete_records = document_records or []
+        if not complete_records and chunks:
+            complete_records = []
+            seen_sources = set()
+            for chunk in chunks:
+                source = chunk.get("source", "Unknown document")
+                page = chunk.get("page", "")
+                key = (source, str(page), chunk.get("record_id", ""))
+                if key in seen_sources:
+                    continue
+                seen_sources.add(key)
+                complete_records.append({
+                    "source": source,
+                    "page": page,
+                    "location": chunk.get("location", source),
+                    "method": chunk.get("method", ""),
+                    "text": chunk.get("text", ""),
+                })
+        return build_complete_details_answer(complete_records, language)
 
     results = find_relevant_results(
         question,
@@ -2356,7 +2377,10 @@ if ask_submitted:
 
         # Ignore accidental duplicate Enter/button submissions.
         if previous_hash == question_hash and (now - previous_time) < 10:
-            st.info("This question was just submitted. Please wait for the current result.")
+            if st.session_state.get("answer_busy", False):
+                st.info("This question is still being processed. Please wait for the current result.")
+            else:
+                st.info("This question was already processed. The latest result is shown below.")
             st.stop()
 
         # A non-blocking process lock prevents a second simultaneous Streamlit
