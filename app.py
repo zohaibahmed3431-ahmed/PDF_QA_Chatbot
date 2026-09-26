@@ -76,21 +76,6 @@ with st.sidebar:
         "fuzzy matches, and semantic meaning."
     )
 
-    st.divider()
-
-    st.subheader("RAG Configuration")
-    chunk_strategy = st.selectbox(
-        "Chunking Strategy",
-        [
-            "Balanced (850 / 140)",
-            "Small (500 / 80)",
-            "Large (1200 / 180)",
-        ],
-        help="Choose how the document is split into searchable chunks."
-    )
-
-    st.divider()
-
     st.caption(
         "Answers are grounded in uploaded documents. "
         "The assistant does not invent source locations."
@@ -2109,9 +2094,6 @@ if "processed_signature" not in st.session_state:
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-if "chunk_strategy" not in st.session_state:
-    st.session_state.chunk_strategy = "Balanced (850 / 140)"
-
 if "evaluation_results" not in st.session_state:
     st.session_state.evaluation_results = None
 
@@ -2145,7 +2127,9 @@ if "last_question" not in st.session_state:
 if "last_answer" not in st.session_state:
     st.session_state.last_answer = ""
 
-st.session_state.chunk_strategy = chunk_strategy
+# Chunking remains internal so document search keeps working, but the
+# experimental RAG/chunking control is intentionally hidden for now.
+chunk_strategy = "Balanced (850 / 140)"
 
 
 # ============================================================
