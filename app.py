@@ -2843,67 +2843,108 @@ def evaluate_rag(rows, index, chunks, language, use_gemini=False):
 
 
 # ============================================================
-# COMPLETE EXTRACTED DOCUMENT DETAILS
+# PROFESSIONAL DOCUMENT DETAILS CSV
 # ============================================================
 
 def build_document_details_csv(records):
-    """Create a client-ready, source-grounded CSV of extracted document details.
+    """Build a normalized, client-ready CSV from the processed documents.
 
-    Image/scanned documents:
-      * Vision transcription is the primary source for readable details.
-      * OCR is preserved only as one complete transcription when Vision is absent.
-      * OCR fragments/garbage are NEVER exported as individual facts.
-      * Labels + their following value/dimension are combined into one meaningful row.
+    The export is deliberately tabular rather than a dump of OCR fragments.
+    Every row represents either:
+      1) one normalized document fact/detail, or
+      2) one complete raw transcription for auditability.
 
-    Text documents:
-      * Complete text is preserved once.
-      * Meaningful non-empty lines are exported as details.
-
+    OCR is never split into character/garbage fragments. For images, Vision
+    is the preferred readable source; OCR is retained as a complete raw
+    transcription only when useful for audit/search.
     Hard limit: 100,000 rows.
     """
     output = io.StringIO()
     fieldnames = [
-        "id", "source_file", "page", "location", "extraction_method",
-        "detail_type", "record_id", "field", "details",
+        "record_id",
+        "source_file",
+        "page",
+        "source_location",
+        "extraction_method",
+        "record_type",
+        "category",
+        "field",
+        "value",
+        "source_text",
     ]
     writer = csv.DictWriter(output, fieldnames=fieldnames)
     writer.writeheader()
+
     row_id = 0
     seen = set()
 
     def clean(value):
-        return normalize_text(str(value or "")).strip()
+        value = str(value or "")
+        value = value.replace("\x00", " ")
+        value = re.sub(r"[ \t]+", " ", value)
+        value = re.sub(r"\n[ \t]+", "\n", value)
+        return value.strip()
 
-    def emit(record, detail_type, details, field="", method=None):
+    def normalize_phone(value):
+        return re.sub(r"[^0-9+]", "", value or "")
+
+    def is_noise(value):
+        value = clean(value)
+        if not value or len(value) < 2:
+            return True
+        # Never export isolated OCR punctuation or tiny symbol fragments.
+        alnum = sum(ch.isalnum() for ch in value)
+        if alnum == 0:
+            return True
+        if len(value) <= 4 and alnum <= 2 and not re.search(r"[A-Za-z]{2,}|\d{2,}", value):
+            return True
+        return False
+
+    def emit(record, category, field, value, source_text,
+             record_type="fact", method=None):
         nonlocal row_id
-        details = clean(details)
-        field = clean(field)
-        if not details or row_id >= 100000:
+        if row_id >= 100000:
             return
+
+        source_file = clean(record.get("source", ""))
+        page = record.get("page", "")
+        location = clean(record.get("location", ""))
+        extraction = clean(method or record.get("method", ""))
+        field = clean(field)
+        value = clean(value)
+        source_text = clean(source_text)
+
+        if not value and not source_text:
+            return
+
+        # Stable de-duplication: same source + category + field + value once.
         key = (
-            clean(record.get("record_id", "")),
-            clean(detail_type),
+            source_file,
+            str(page),
+            category.lower(),
             field.lower(),
-            normalize_for_search(details),
+            normalize_for_search(value),
+            record_type.lower(),
         )
         if key in seen:
             return
         seen.add(key)
+
         row_id += 1
         writer.writerow({
-            "id": row_id,
-            "source_file": clean(record.get("source", "")),
-            "page": record.get("page", "") if record.get("page") is not None else "",
-            "location": clean(record.get("location", "")),
-            "extraction_method": method or clean(record.get("method", "")),
-            "detail_type": detail_type,
-            "record_id": clean(record.get("record_id", "")),
+            "record_id": f"DOC-{row_id:06d}",
+            "source_file": source_file,
+            "page": page,
+            "source_location": location,
+            "extraction_method": extraction,
+            "record_type": record_type,
+            "category": clean(category),
             "field": field,
-            "details": details,
+            "value": value,
+            "source_text": source_text,
         })
 
     def split_sections(text):
-        """Return OCR and Vision blocks from the combined image extraction."""
         text = str(text or "")
         vision_match = re.search(
             r"(?is)vision\s+(?:transcription|text)\s*:\s*(.*?)(?=\n\s*ocr\s+(?:transcription|text)\s*:|\Z)",
@@ -2919,59 +2960,109 @@ def build_document_details_csv(records):
         )
 
     def looks_like_dimension(value):
-        return bool(re.search(r"\d+\s*['’]\s*-?\s*\d+|\d+(?:\.\d+)?\s*(?:sq\.?\s*ft|sqft)", value, re.I))
+        return bool(re.search(
+            r"\d+\s*['’]\s*-?\s*\d+|"
+            r"\d+(?:\.\d+)?\s*(?:sq\.?\s*ft|sqft|square\s*feet)",
+            value, re.I
+        ))
 
-    def is_noise(value):
-        """Conservative filter: remove obvious OCR garbage, not real words."""
-        value = clean(value)
-        if len(value) < 2:
-            return True
-        alnum = sum(ch.isalnum() for ch in value)
-        if alnum == 0:
-            return True
-        # Single/tiny tokens made only from suspicious OCR symbols.
-        if len(value) <= 4 and alnum <= 2 and not re.search(r"[A-Za-z]{2,}|\d{2,}", value):
-            return True
-        return False
+    def parse_fact(line, next_line=""):
+        """Return (category, field, value, consumed_next) generically."""
+        line = clean(line)
+        next_line = clean(next_line)
 
-    def vision_details(lines):
-        """Turn Vision transcription into meaningful fact rows."""
-        cleaned = []
-        for raw_line in lines:
+        if not line:
+            return None, None, None, False
+
+        # Phone/contact information.
+        phone_matches = re.findall(
+            r"(?:\+?92[-\s]?)?0?3\d{2}[-\s]?\d{7}", line
+        )
+        if phone_matches:
+            numbers = [m.strip() for m in phone_matches]
+            return "Contact", "Phone", ", ".join(numbers), False
+
+        # Contact label followed by a phone line.
+        if re.match(r"^contact\s*:?\s*$", line, re.I) and next_line:
+            nums = re.findall(
+                r"(?:\+?92[-\s]?)?0?3\d{2}[-\s]?\d{7}", next_line
+            )
+            if nums:
+                return "Contact", "Phone", ", ".join(n.strip() for n in nums), True
+
+        # Address/location-like text.
+        if re.search(
+            r"\b(block|street|st\.|road|rd\.|avenue|ave\.|town|scheme|sector|"
+            r"malir|karachi|lahore|islamabad|rawalpindi|cant)\b",
+            line, re.I
+        ):
+            return "Location", "Address", line, False
+
+        # Do not merge unrelated consecutive lines. A professional export
+        # keeps each source line independent unless the same line itself
+        # contains a clear field/value pair.
+
+        # Same-line dimension: "ROOM 12'-0 x 10'-0".
+        dimension_match = re.search(
+            r"\b(\d+\s*['’]\s*-?\s*\d+(?:\s*\"|”)?"
+            r"(?:\s*[x×]\s*\d+\s*['’]\s*-?\s*\d+(?:\s*\"|”)?)*"
+            r"(?:\s*[-–]\s*\d+\s*['’]\s*-?\s*\d+(?:\s*\"|”)?)?)",
+            line,
+            re.I
+        )
+        if dimension_match:
+            dim = clean(dimension_match.group(1))
+            label = clean(line[:dimension_match.start()])
+            if label:
+                return "Property Detail", label, dim, False
+
+        # Property/area statement.
+        if re.search(r"\b\d+\s+rooms?\b|\bsq\.?\s*ft\b", line, re.I):
+            return "Property Detail", "Specification", line, False
+
+        # Common document identity wording, without relying on a specific brand.
+        if re.search(r"\b(marketing|developer|builder|company|residency|residence)\b", line, re.I):
+            return "Organization / Property", "Name", line, False
+
+        # Amenities/facilities are kept as facts, not invented values.
+        amenity_terms = (
+            "prayer", "play area", "security", "cctv", "lift", "cargo",
+            "water", "gym", "generator", "parking", "lounge", "entrance",
+            "terrace", "kitchen", "bedroom", "bathroom"
+        )
+        if any(term in line.lower() for term in amenity_terms):
+            return "Facility / Feature", "Detail", line, False
+
+        # Generic readable detail.
+        return "Document Detail", "Detail", line, False
+
+    def add_image_facts(record, vision_text):
+        lines = []
+        for raw_line in vision_text.splitlines():
             line = clean(raw_line)
-            if not line or is_noise(line):
-                continue
-            # Remove obvious markdown/list prefixes without changing content.
             line = re.sub(r"^[-•*]+\s*", "", line).strip()
-            if line:
-                cleaned.append(line)
+            if line and not is_noise(line):
+                lines.append(line)
 
         i = 0
-        while i < len(cleaned):
-            line = cleaned[i]
-            nxt = cleaned[i + 1] if i + 1 < len(cleaned) else ""
+        while i < len(lines) and row_id < 100000:
+            line = lines[i]
+            nxt = lines[i + 1] if i + 1 < len(lines) else ""
 
-            # Label + dimension/value on the next line.
-            if nxt and (looks_like_dimension(nxt) or re.match(r"^\d+\s+rooms?\b", nxt, re.I)):
+            category, field, value, consumed = parse_fact(line, nxt)
+            if category:
                 emit(
                     record,
-                    "Vision Detail",
-                    f"{line}: {nxt}",
-                    field=line,
+                    category,
+                    field,
+                    value,
+                    line if not consumed else f"{line} | {nxt}",
+                    record_type="fact",
                     method="ocr+vision:vision",
                 )
-                i += 2
-                continue
-
-            # Contact label followed by phone numbers.
-            if re.match(r"^contact\s*:?$", line, re.I) and nxt:
-                emit(record, "Vision Detail", f"Contact: {nxt}", field="Contact", method="ocr+vision:vision")
-                i += 2
-                continue
-
-            # Preserve every other meaningful Vision line as a fact.
-            emit(record, "Vision Detail", line, field=line, method="ocr+vision:vision")
-            i += 1
+                i += 2 if consumed else 1
+            else:
+                i += 1
 
     for record in records:
         if row_id >= 100000:
@@ -2986,42 +3077,89 @@ def build_document_details_csv(records):
 
         method = clean(record.get("method", ""))
         is_image_record = (
-            "ocr" in method.lower() or "vision" in method.lower()
-            or method.lower() == "image" or record.get("image_data") is not None
+            "ocr" in method.lower()
+            or "vision" in method.lower()
+            or method.lower() == "image"
+            or record.get("image_data") is not None
         )
 
         if is_image_record:
             ocr_text, vision_text = split_sections(text)
 
-            # Prefer Vision for client-facing details because it is semantic
-            # transcription; do not expose noisy OCR fragments as fake facts.
+            # Facts/details come first so the CSV opens as a clean client-facing
+            # table. Complete transcriptions are appended afterward as audit rows.
             if vision_text:
-                emit(record, "Vision - Complete", vision_text, field="Complete Vision Transcription", method="ocr+vision:vision")
-                vision_details(vision_text.splitlines())
-            elif ocr_text:
-                # If Vision is unavailable, keep OCR intact as ONE evidence row.
-                emit(record, "OCR - Complete", ocr_text, field="Complete OCR Transcription", method="ocr+vision:ocr")
-            else:
-                # Fallback for image records whose text was not marked with headings.
-                emit(record, "Extracted Text - Complete", text, field="Complete Extracted Text", method=method)
+                add_image_facts(record, vision_text)
+                emit(
+                    record,
+                    "Raw Transcription",
+                    "Vision Transcription",
+                    vision_text,
+                    vision_text,
+                    record_type="raw",
+                    method="ocr+vision:vision",
+                )
+
+            # Complete OCR is retained only as one audit row. It is NEVER
+            # split into noisy OCR fragments.
+            if ocr_text:
+                emit(
+                    record,
+                    "Raw Transcription",
+                    "OCR Transcription",
+                    ocr_text,
+                    ocr_text,
+                    record_type="raw",
+                    method="ocr+vision:ocr",
+                )
+
+            if not vision_text and not ocr_text:
+                emit(
+                    record,
+                    "Raw Transcription",
+                    "Extracted Text",
+                    text,
+                    text,
+                    record_type="raw",
+                    method=method,
+                )
             continue
 
-        # Normal documents: preserve complete text plus meaningful lines.
-        emit(record, "Document Text - Complete", text, field="Complete Document Text", method=method)
-        for line in text.splitlines():
-            line = clean(line)
-            if len(line) >= 2:
-                emit(record, "Document Detail", line, field=line, method=method)
+        # Text/office documents: one complete raw record plus meaningful lines.
+        emit(
+            record,
+            "Raw Document",
+            "Complete Text",
+            text,
+            text,
+            record_type="raw",
+            method=method,
+        )
+        for raw_line in text.splitlines():
+            line = clean(raw_line)
+            if is_noise(line):
+                continue
+            category, field, value, _ = parse_fact(line)
+            emit(
+                record,
+                category,
+                field,
+                value,
+                line,
+                record_type="fact",
+                method=method,
+            )
 
     return output.getvalue()
 
 
 if st.session_state.get("document_records"):
     st.divider()
-    st.subheader("📋 Complete Document Details")
+    st.subheader("📋 Professional Document Details")
     st.caption(
-        f"All readable details extracted from the currently processed documents. "
-        f"Maximum export size: 100,000 rows."
+        "Normalized, source-grounded CSV with one meaningful detail per row. "
+        "Complete raw transcriptions are retained separately for auditability. "
+        "Maximum export size: 100,000 rows."
     )
 
     document_csv = build_document_details_csv(
@@ -3029,9 +3167,9 @@ if st.session_state.get("document_records"):
     )
 
     st.download_button(
-        "⬇️ Download Complete Document Details CSV",
-        data=document_csv.encode("utf-8"),
-        file_name="complete_document_details.csv",
+        "⬇️ Download Professional Document Details CSV",
+        data=document_csv.encode("utf-8-sig"),
+        file_name="document_details.csv",
         mime="text/csv",
         use_container_width=True,
     )
