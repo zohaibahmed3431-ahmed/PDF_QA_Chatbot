@@ -1869,39 +1869,116 @@ def deterministic_answer(
 # ============================================================
 
 def build_complete_details_answer(records, language="English"):
-    """Return a complete, source-grounded overview of every uploaded document."""
+    """Return a professional, complete, source-grounded overview.
+
+    Image documents are presented as structured details instead of one long OCR
+    paragraph. Text/PDF/Office documents keep their complete readable content.
+    Nothing is inferred beyond the extracted source text.
+    """
     if not records:
         return "No readable document content is available."
 
-    parts = []
-    for record in records:
-        text = normalize_text(record.get("text", ""))
-        if not text:
-            continue
-        source = record.get("source", "Unknown document")
-        page = record.get("page")
-        location = record.get("location", source)
+    def clean(v):
+        v = str(v or "").replace("\x00", " ")
+        v = re.sub(r"[ \t]+", " ", v)
+        return v.strip(" -•*|")
 
-        # Prefer the vision transcription for image documents.
+    def get_vision(text):
         m = re.search(
             r"(?is)vision\s+(?:transcription|text)\s*:\s*(.*?)(?=\n\s*ocr\s+(?:transcription|text)\s*:|\Z)",
             text,
         )
-        readable = normalize_text(m.group(1)) if m else text
+        return clean(m.group(1)) if m else ""
 
-        title = f"### {source}"
+    def is_noise(line):
+        line = clean(line)
+        if len(line) < 2:
+            return True
+        if re.fullmatch(r"[\\/*|_~`^.,;:'\"\-]+", line):
+            return True
+        return False
+
+    def is_measurement(line):
+        return bool(re.search(r"\d+\s*['’]\s*-?\s*\d+|\d+(?:\.\d+)?\s*(?:sq\.?\s*ft|sqft)", line, re.I))
+
+    def section_for(line):
+        low = line.lower()
+        if re.search(r"\b(contact|phone|mobile|tel)\b", low):
+            return "Contact"
+        if re.search(r"\b(fl\s*\d|block|scheme|town|road|avenue|malir|karachi|address)\b", low):
+            return "Location"
+        if re.search(r"\b(prayer|play area|security|cctv|lift|water|gym|generator|parking)\b", low):
+            return "Facilities & Features"
+        if re.search(r"\b(tv lounge|entrance|kitchen|bedroom|bathroom|terrace|rooms?|sq\.?\s*ft|apartment|type c)\b", low):
+            return "Property Details"
+        if re.search(r"\b(residency|marketing|company|organization)\b", low):
+            return "Organization / Property"
+        return "Other Document Details"
+
+    parts = []
+    for record in records:
+        text = clean(record.get("text", ""))
+        if not text:
+            continue
+        source = clean(record.get("source", "Unknown document"))
+        page = record.get("page")
+        method = clean(record.get("method", ""))
+        ext = source.lower().rsplit(".", 1)[-1] if "." in source else ""
+        is_image = ext in {"jpg", "jpeg", "png", "webp"} or "vision" in method.lower()
+
+        heading = f"### {source}"
         if page not in (None, "", "nan"):
-            title += f" — Page {page}"
-        parts.append(f"{title}\n**Source:** {location}\n\n{readable}")
+            heading += f" — Page {page}"
+
+        if not is_image:
+            parts.append(heading + "\n\n" + text)
+            continue
+
+        readable = get_vision(text) or text
+        raw_lines = [clean(x) for x in readable.splitlines()]
+        lines = [x for x in raw_lines if x and not is_noise(x)]
+
+        sections = {}
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            nxt = lines[i + 1] if i + 1 < len(lines) else ""
+
+            # Keep a label and its measurement/value together.
+            if nxt and is_measurement(nxt) and not is_measurement(line):
+                sections.setdefault(section_for(line), []).append(f"**{line}:** {nxt}")
+                i += 2
+                continue
+
+            # Keep address/contact strings intact.
+            sections.setdefault(section_for(line), []).append(line)
+            i += 1
+
+        section_order = [
+            "Organization / Property",
+            "Property Details",
+            "Facilities & Features",
+            "Location",
+            "Contact",
+            "Other Document Details",
+        ]
+        body = []
+        for sec in section_order:
+            values = sections.get(sec, [])
+            if not values:
+                continue
+            body.append(f"**{sec}**\n" + "\n".join(f"- {v}" for v in values))
+
+        parts.append(heading + "\n\n" + "\n\n".join(body))
 
     if not parts:
         return "No readable document content is available."
 
     intro = {
-        "English": "## Complete document details\n\nBelow is the complete readable content available from the uploaded document collection. No facts have been added outside the documents.",
-        "Roman Urdu": "## Document ki complete details\n\nNeeche uploaded documents se available tamam readable content diya gaya hai. Bahar se koi fact add nahi kiya gaya.",
-        "Urdu": "## دستاویز کی مکمل تفصیلات\n\nذیل میں اپ لوڈ کی گئی دستاویزات سے دستیاب تمام قابلِ مطالعہ مواد دیا گیا ہے۔ باہر سے کوئی معلومات شامل نہیں کی گئی۔",
-    }.get(language, "## Complete document details\n\nBelow is the complete readable content available from the uploaded document collection.")
+        "English": "## Complete document details\n\nHere is the complete readable information extracted from the uploaded document(s), organized into professional sections. No outside facts have been added.",
+        "Roman Urdu": "## Document ki complete details\n\nNeeche uploaded document(s) se nikali hui tamam readable information professional sections mein organize ki gayi hai. Bahar se koi fact add nahi kiya gaya.",
+        "Urdu": "## دستاویز کی مکمل تفصیلات\n\nذیل میں اپ لوڈ کی گئی دستاویزات سے حاصل شدہ تمام قابلِ مطالعہ معلومات کو پیشہ ورانہ حصوں میں منظم کیا گیا ہے۔ باہر سے کوئی معلومات شامل نہیں کی گئی۔",
+    }.get(language, "## Complete document details\n\nHere is the complete readable information extracted from the uploaded document(s), organized into professional sections. No outside facts have been added.")
 
     return intro + "\n\n" + "\n\n---\n\n".join(parts)
 
@@ -1929,29 +2006,8 @@ def answer_question(
 
     # IMPORTANT: a generic full-details request must NOT be limited to the
     # top semantic search results. Return the entire uploaded collection.
-    if normalized_question in full_detail_requests:
-        # Full-details mode must never fall back to top-k RAG retrieval.
-        # Prefer the original extracted records; if they are unavailable,
-        # reconstruct source records from the current searchable chunks.
-        complete_records = document_records or []
-        if not complete_records and chunks:
-            complete_records = []
-            seen_sources = set()
-            for chunk in chunks:
-                source = chunk.get("source", "Unknown document")
-                page = chunk.get("page", "")
-                key = (source, str(page), chunk.get("record_id", ""))
-                if key in seen_sources:
-                    continue
-                seen_sources.add(key)
-                complete_records.append({
-                    "source": source,
-                    "page": page,
-                    "location": chunk.get("location", source),
-                    "method": chunk.get("method", ""),
-                    "text": chunk.get("text", ""),
-                })
-        return build_complete_details_answer(complete_records, language)
+    if normalized_question in full_detail_requests and document_records:
+        return build_complete_details_answer(document_records, language)
 
     results = find_relevant_results(
         question,
@@ -2377,10 +2433,7 @@ if ask_submitted:
 
         # Ignore accidental duplicate Enter/button submissions.
         if previous_hash == question_hash and (now - previous_time) < 10:
-            if st.session_state.get("answer_busy", False):
-                st.info("This question is still being processed. Please wait for the current result.")
-            else:
-                st.info("This question was already processed. The latest result is shown below.")
+            st.info("This question was just submitted. Please wait for the current result.")
             st.stop()
 
         # A non-blocking process lock prevents a second simultaneous Streamlit
